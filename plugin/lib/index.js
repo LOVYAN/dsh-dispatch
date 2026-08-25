@@ -344,7 +344,7 @@ export class DispatchService extends Service {
 				const kind = src?.kind
 				if (kind && kind !== 'user') continue
 				const text = this.blocksText(ev.data?.content ?? ev.data?.message?.content)
-				if (text) out.push({ role: 'user', text, time: ev.time })
+				if (text && !text.startsWith('/permission ')) out.push({ role: 'user', text, time: ev.time })
 			} else if (ev.type === 'assistant/message') {
 				const text = this.visibleAssistantText(this.blocksText(ev.data?.message?.content ?? ev.data?.content))
 				if (text) out.push({ role: 'assistant', text, time: ev.time })
@@ -353,14 +353,48 @@ export class DispatchService extends Service {
 		return out
 	}
 
-	sessionTitleOf(row) {
-		const v = row?.projections?.values?.title
+	titleFromProjections(projections, fallback) {
+		const v = projections?.values?.title
 		if (typeof v === 'string' && v.trim()) return v.trim()
 		if (v && typeof v === 'object') {
 			const t = v.title ?? v.value ?? v.text
 			if (typeof t === 'string' && t.trim()) return t.trim()
 		}
-		return (row?.sessionId ?? 'session').slice(-12)
+		return fallback
+	}
+
+	sessionTitleOf(row) {
+		return this.titleFromProjections(row?.projections, (row?.sessionId ?? 'session').slice(-12))
+	}
+
+	permissionLabel(id) {
+		return ({
+			'read-only': '只读',
+			'workspace-write': '工作区可写（默认，越权要审批）',
+			'danger-full-access': '完全权限（不再弹审批）'
+		}[id] || id)
+	}
+
+	async listAgentPresets() {
+		try {
+			const listed = await this.client.agentPresets.list({})
+			if (!listed.result.ok) return []
+			return (listed.result.value.presets ?? []).filter((p) => !p.broken)
+		} catch {
+			return []
+		}
+	}
+
+	async applyPermission(sessionId, preset) {
+		const allowed = new Set(['read-only', 'workspace-write', 'danger-full-access'])
+		if (!allowed.has(preset)) return
+		const r = await this.client.sessions.prompt({
+			sessionId,
+			mode: 'queue',
+			content: [{ type: 'text', text: `/permission ${preset}` }]
+		})
+		if (!r.result.ok) throw new Error(JSON.stringify(r.result.error))
+		this.note('permission', { sessionId, preset })
 	}
 
 	async lastAssistantText(sessionId) {
@@ -404,7 +438,7 @@ export class DispatchService extends Service {
 			'.msg{margin:10px 0;padding:10px 12px;border-radius:12px;white-space:pre-wrap;word-break:break-word;line-height:1.45}',
 			'.user{background:#1c2541} .assistant{background:#193c3a}',
 			'.meta{opacity:.55;font-size:12px;margin-bottom:4px}',
-			'textarea,input[type=text]{width:100%;box-sizing:border-box;background:#1c2541;color:#e6f1ff;border:1px solid #3a506b;border-radius:10px;padding:10px;font:inherit}',
+			'textarea,input[type=text],select{width:100%;box-sizing:border-box;background:#1c2541;color:#e6f1ff;border:1px solid #3a506b;border-radius:10px;padding:10px;font:inherit}',
 			'button{background:#3a86ff;color:#fff;border:0;border-radius:10px;padding:10px 16px;font:inherit;margin-top:8px}',
 			'.row{padding:12px 0;border-bottom:1px solid #1c2541}',
 			'.muted{opacity:.65;font-size:13px}',
@@ -412,6 +446,10 @@ export class DispatchService extends Service {
 			'.banner form{display:flex;gap:8px;padding:0;margin:8px 0 0}',
 			'.banner button{margin:0}',
 			'.deny{background:#6c757d}',
+			'details.adv{margin:12px 0;border:1px solid #1c2541;border-radius:12px;padding:4px 12px 8px;background:#111a33}',
+			'details.adv>summary{cursor:pointer;list-style:none;padding:10px 0;color:#8be9fd}',
+			'details.adv>summary::-webkit-details-marker{display:none}',
+			'details.adv form{padding:4px 0}',
 			'</style></head><body>',
 			body,
 			'</body></html>'
@@ -518,13 +556,15 @@ export class DispatchService extends Service {
 		}
 	}
 
-	async handleChatList(_urlObj, res) {
+	async handleChatList(urlObj, res) {
 		const listed = await this.client.sessions.list({})
 		if (!listed.result.ok) return this.sendJson(res, 502, { ok: false, error: listed.result.error })
 		const archived = await this.archivedIdSet()
-		const items = (listed.result.value.items ?? [])
-			.filter((s) => !s.blank && !archived.has(s.sessionId) && s.origin !== 'subagent')
-			.slice(0, 30)
+		const showArchived = urlObj.searchParams.get('archived') === '1'
+		const all = (listed.result.value.items ?? []).filter((s) => !s.blank && s.origin !== 'subagent')
+		const live = all.filter((s) => !archived.has(s.sessionId))
+		const archivedRows = all.filter((s) => archived.has(s.sessionId))
+		const items = (showArchived ? archivedRows : live).slice(0, 40)
 		const pendingBySid = new Map()
 		for (const [, e] of this.pending) {
 			pendingBySid.set(e.sessionId, (pendingBySid.get(e.sessionId) ?? 0) + 1)
@@ -537,24 +577,62 @@ export class DispatchService extends Service {
 			const cwd = s.cwd ? this.escHtml(s.cwd) : ''
 			return `<div class="row"><a href="${this.escHtml(href)}">${title}</a><div class="muted">${this.escHtml(s.sessionId.slice(-12))}${run}${need}${cwd ? ' · ' + cwd : ''}</div></div>`
 		}).join('')
-		const body = [
-			'<header><strong>dsh 手机会话</strong></header><main>',
+		const nav = showArchived
+			? `<p><a href="${this.escHtml(this.chatPath())}">← 进行中</a> · 已归档 ${archivedRows.length}</p>`
+			: `<p><a href="${this.escHtml(this.chatPath() + '&archived=1')}">已归档（${archivedRows.length}）</a></p>`
+		let presetOpts = ''
+		if (!showArchived) {
+			const presets = await this.listAgentPresets()
+			if (presets.length) {
+				presetOpts = '<label class="muted">模式（agent preset）</label><select name="agentPreset">'
+					+ presets.map((p) => {
+						const label = (p.name || p.id) + (p.isDefault ? '（默认）' : '') + (p.trust === 'user' ? ' · 用户' : '')
+						return '<option value="' + this.escHtml(p.id) + '"' + (p.isDefault ? ' selected' : '') + '>' + this.escHtml(label) + '</option>'
+					}).join('')
+					+ '</select>'
+			}
+		}
+		const permOpts = ['workspace-write', 'read-only', 'danger-full-access'].map((id) =>
+			'<option value="' + id + '"' + (id === 'workspace-write' ? ' selected' : '') + '>' + this.escHtml(this.permissionLabel(id)) + '</option>'
+		).join('')
+		const composer = showArchived ? '' : [
 			'<form method="post" action="' + this.escHtml(this.chatPath()) + '">',
 			'<textarea name="text" rows="3" placeholder="新开一个会话，说你要它干什么…" required></textarea>',
-			'<button type="submit">发送</button></form>',
-			rows || '<p class="muted">还没有会话</p>',
+			'<button type="submit">发送</button>',
+			'<details class="adv"><summary>高级 · 模式 / 权限</summary>',
+			presetOpts,
+			'<label class="muted">权限</label><select name="permission">' + permOpts + '</select>',
+			'</details></form>'
+		].join('')
+		const empty = showArchived ? '没有已归档会话' : '还没有会话'
+		const heading = showArchived ? '已归档' : 'dsh 手机会话'
+		const advJs = '<script>(function(){document.querySelectorAll("details.adv").forEach(function(d){var dk="dsh-adv-"+location.pathname;try{if(sessionStorage.getItem(dk)==="1")d.open=true}catch(e){}d.addEventListener("toggle",function(){try{sessionStorage.setItem(dk,d.open?"1":"0")}catch(e){}})})})()</script>'
+		const body = [
+			'<header><strong>' + heading + '</strong></header><main>',
+			nav, composer,
+			rows || '<p class="muted">' + empty + '</p>',
+			advJs,
 			'</main>'
 		].join('')
-		this.sendHtml(res, this.pageShell('dsh 会话', body))
+		this.sendHtml(res, this.pageShell(heading, body))
 	}
 
 	async handleChatNew(req, urlObj, res) {
 		const fields = await this.readForm(req, urlObj)
 		const text = (fields.text ?? '').trim()
 		if (!text) return this.sendHtml(res, this.pageShell('dsh', '<main><p>内容不能为空</p></main>'), 400)
-		const created = await this.client.sessions.create({})
+		const createReq = {}
+		const agentPreset = (fields.agentPreset ?? '').trim()
+		if (agentPreset) createReq.agentPreset = agentPreset
+		const created = await this.client.sessions.create(createReq)
 		if (!created.result.ok) return this.sendJson(res, 502, { ok: false, stage: 'create', error: created.result.error })
 		const sessionId = created.result.value.sessionId
+		const permission = (fields.permission ?? '').trim()
+		if (permission && permission !== 'workspace-write') {
+			try { await this.applyPermission(sessionId, permission) } catch (err) {
+				this.log('permission at create failed:', err)
+			}
+		}
 		const prompted = await this.client.sessions.prompt({
 			sessionId,
 			mode: 'queue',
@@ -569,10 +647,40 @@ export class DispatchService extends Service {
 
 	async handleChatView(rawId, urlObj, res) {
 		const sessionId = decodeURIComponent(rawId.split('?')[0])
+		if (urlObj.searchParams.get('archive') === '1') {
+			const archived = await this.client.workspace.archiveSession({ sessionId })
+			if (!archived.result.ok) {
+				return this.sendHtml(res, this.pageShell('归档失败', `<main><p>${this.escHtml(JSON.stringify(archived.result.error))}</p><p><a href="${this.escHtml(this.chatPath(sessionId))}">返回会话</a></p></main>`), 502)
+			}
+			this.note('archived', { sessionId })
+			this.log(`archived ${sessionId}`)
+			return this.redirect(res, this.chatPath() + '&archived=1')
+		}
 		const decideRpc = urlObj.searchParams.get('decide')
 		const decideOut = urlObj.searchParams.get('outcome')
 		if (decideRpc && OUTCOMES.has(decideOut ?? '')) {
 			await this.applyDecision(decideRpc, decideOut, sessionId, this.pending.get(decideRpc)?.approvalId ?? '')
+			return this.redirect(res, this.chatPath(sessionId))
+		}
+		const switchModel = urlObj.searchParams.get('switchModel')
+		if (switchModel) {
+			const sep = switchModel.indexOf('|')
+			const provider = sep >= 0 ? switchModel.slice(0, sep) : ''
+			const model = sep >= 0 ? switchModel.slice(sep + 1) : ''
+			if (provider && model) {
+				const selected = await this.client.sessions.selectModel({ sessionId, provider, model })
+				if (!selected.result.ok) {
+					return this.sendHtml(res, this.pageShell('换模型失败', `<main><p>${this.escHtml(JSON.stringify(selected.result.error))}</p><p><a href="${this.escHtml(this.chatPath(sessionId))}">返回会话</a></p></main>`), 502)
+				}
+				this.note('model', { sessionId, provider, model })
+			}
+			return this.redirect(res, this.chatPath(sessionId))
+		}
+		const switchPerm = urlObj.searchParams.get('switchPermission')
+		if (switchPerm) {
+			try { await this.applyPermission(sessionId, switchPerm) } catch (err) {
+				return this.sendHtml(res, this.pageShell('改权限失败', `<main><p>${this.escHtml(String(err?.message ?? err))}</p><p><a href="${this.escHtml(this.chatPath(sessionId))}">返回会话</a></p></main>`), 502)
+			}
 			return this.redirect(res, this.chatPath(sessionId))
 		}
 		const hist = await this.client.sessions.history({ sessionId, maxMessages: 40 })
@@ -610,9 +718,11 @@ export class DispatchService extends Service {
 			'var n=document.querySelectorAll(".msg").length;',
 			'var prevN=0;try{prevN=parseInt(sessionStorage.getItem(nk)||"0",10)||0}catch(e){}',
 			'try{sessionStorage.setItem(nk,String(n))}catch(e){}',
+			'function pinComposer(){var el=document.getElementById("composer")||ta;if(el)el.scrollIntoView({block:"end"})}',
 			'function restore(){',
+			waiting ? 'pinComposer();return;' : '',
 			'  var grew=n>prevN;',
-			'  if(grew){var last=document.querySelector(".msg:last-of-type");if(last)last.scrollIntoView({block:"end"});return}',
+			'  if(grew){pinComposer();return}',
 			'  try{var y=sessionStorage.getItem(sk);if(y)scrollTo(0,parseInt(y,10)||0)}catch(e){}',
 			'}',
 			'restore();setTimeout(restore,0);',
@@ -622,25 +732,92 @@ export class DispatchService extends Service {
 			'ta.addEventListener("input",function(){try{sessionStorage.setItem(k,ta.value)}catch(e){}});',
 			'}',
 			'document.querySelectorAll("form").forEach(function(f){f.addEventListener("submit",function(){if(f.querySelector("textarea[name=text]"))try{sessionStorage.removeItem(k)}catch(e){}})});',
+			'document.querySelectorAll("details.adv").forEach(function(d){var dk="dsh-adv-"+location.pathname;try{if(sessionStorage.getItem(dk)==="1")d.open=true}catch(e){}d.addEventListener("toggle",function(){try{sessionStorage.setItem(dk,d.open?"1":"0")}catch(e){}})});',
 			waiting ? 'setTimeout(function tick(){if(ta&&(ta.value||"").trim()){setTimeout(tick,4000);return}location.reload()},4000);' : '',
 			'})()</script>'
 		].join('')
-		const body = [
-			'<header><a href="' + this.escHtml(this.chatPath()) + '">← 会话列表</a><strong style="margin-left:auto">' + this.escHtml(sessionId.slice(-12)) + '</strong></header>',
-			'<main>', extra, banners, msgs,
+		const archivedSet = await this.archivedIdSet()
+		const isArchived = archivedSet.has(sessionId)
+		const archiveLink = isArchived
+			? '<span class="muted">已归档 · 恢复请在电脑 GUI 操作</span>'
+			: '<a href="' + this.escHtml(this.chatPath(sessionId) + '&archive=1') + '" onclick="return confirm(\'归档后会从进行中列表消失，日志还在。确定？\')">归档</a>'
+		let modelForm = ''
+		let modelLabel = ''
+		try {
+			const catalog = await this.client.sessions.models({ sessionId })
+			if (catalog.result.ok) {
+				const cur = catalog.result.value.current
+				const curKey = (cur?.provider || '') + '|' + (cur?.model || '')
+				modelLabel = [cur?.provider, cur?.model].filter(Boolean).join(' / ')
+				const opts = []
+				for (const g of catalog.result.value.groups ?? []) {
+					for (const m of g.models ?? []) {
+						const key = g.id + '|' + m.id
+						const label = (g.name || g.id) + ' · ' + (m.name || m.id)
+						opts.push('<option value="' + this.escHtml(key) + '"' + (key === curKey ? ' selected' : '') + '>' + this.escHtml(label) + '</option>')
+					}
+				}
+				if (opts.length) {
+					modelForm = [
+						'<form method="get" action="' + this.escHtml('/dispatch/chat/' + encodeURIComponent(sessionId)) + '">',
+						'<input type="hidden" name="token" value="' + this.escHtml(this.config.token) + '">',
+						'<label class="muted">模型</label>',
+						'<select name="switchModel">' + opts.join('') + '</select>',
+						'<button type="submit">切换</button></form>'
+					].join('')
+				}
+			}
+		} catch { /* catalog optional */ }
+		let permForm = ''
+		const permNow = hist.result.value.projections?.values?.permissions
+		const permCurrent = permNow?.currentValue || 'workspace-write'
+		const permChoices = (permNow?.options?.length ? permNow.options.map((o) => o.value) : ['read-only', 'workspace-write', 'danger-full-access'])
+			.filter((id) => id && id !== 'custom')
+		if (permChoices.length) {
+			permForm = [
+				'<form method="get" action="' + this.escHtml('/dispatch/chat/' + encodeURIComponent(sessionId)) + '">',
+				'<input type="hidden" name="token" value="' + this.escHtml(this.config.token) + '">',
+				'<label class="muted">权限 · 当前 ' + this.escHtml(this.permissionLabel(permCurrent)) + '</label>',
+				'<select name="switchPermission">',
+				permChoices.map((id) => '<option value="' + this.escHtml(id) + '"' + (id === permCurrent ? ' selected' : '') + '>' + this.escHtml(this.permissionLabel(id)) + '</option>').join(''),
+				'</select><button type="submit">应用权限</button></form>'
+			].join('')
+		}
+		const currentTitle = this.titleFromProjections(hist.result.value.projections, sessionId.slice(-12))
+		const renameForm = [
 			'<form method="post" action="' + this.escHtml(this.chatPath(sessionId)) + '">',
+			'<label class="muted">会话名</label>',
+			'<input type="text" name="title" value="' + this.escHtml(currentTitle) + '" maxlength="80" required>',
+			'<button type="submit">改名</button></form>'
+		].join('')
+		const body = [
+			'<header><a href="' + this.escHtml(this.chatPath()) + '">← 会话列表</a><strong style="margin-left:auto">' + this.escHtml(currentTitle) + '</strong></header>',
+			'<main>', extra, banners, msgs,
+			'<form id="composer" method="post" action="' + this.escHtml(this.chatPath(sessionId)) + '">',
 			'<textarea name="text" rows="3" placeholder="继续说…" required></textarea>',
 			'<button type="submit">发送续聊</button></form>',
-			'<p class="muted">审批也可以直接在本页点。锁屏推送（ntfy）是可选项，不装也能用。</p>',
+			'<details class="adv"><summary>高级 · 模型 / 权限 / 改名</summary>',
+			modelForm, permForm, renameForm,
+			'<p class="muted">' + archiveLink + '</p>',
+			'</details>',
 			draftJs,
 			'</main>'
 		].join('')
-		this.sendHtml(res, this.pageShell('会话 ' + sessionId.slice(-12), body))
+		this.sendHtml(res, this.pageShell(currentTitle, body))
 	}
 
 	async handleChatReply(rawId, req, urlObj, res) {
 		const sessionId = decodeURIComponent(rawId.split('?')[0])
 		const fields = await this.readForm(req, urlObj)
+		const title = (fields.title ?? '').trim()
+		if (title && !(fields.text ?? '').trim()) {
+			const renamed = await this.client.sessions.rename({ sessionId, title })
+			if (!renamed.result.ok) {
+				return this.sendHtml(res, this.pageShell('改名失败', `<main><p>${this.escHtml(JSON.stringify(renamed.result.error))}</p><p><a href="${this.escHtml(this.chatPath(sessionId))}">返回会话</a></p></main>`), 502)
+			}
+			this.note('renamed', { sessionId, title: renamed.result.value.title ?? title })
+			return this.redirect(res, this.chatPath(sessionId))
+		}
 		const text = (fields.text ?? '').trim()
 		if (!text) return this.redirect(res, this.chatPath(sessionId))
 		const prompted = await this.client.sessions.prompt({
