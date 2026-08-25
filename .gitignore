@@ -1,0 +1,28 @@
+# build artifacts
+dist/
+*.zip
+
+# local ntfy downloads / cache (never ship)
+ntfy/*.tar.gz
+ntfy/*.exe
+ntfy/*.zip
+ntfy/cache.db
+ntfy/*.db
+
+# official third-party installers fetched locally
+vendor/downloads/
+
+# editor / OS
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.idea/
+
+# env with secrets
+.env
+.env.*
+*.local
+
+# private planning notes (machine-specific)
+PLAN.md

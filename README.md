@@ -1,0 +1,97 @@
+# dsh-dispatch
+
+DeepSeek Harness 的宿主插件：用手机给本机 Agent **派任务、看回复、续聊、批权限**。
+
+不是再做一个聊天网页套壳。审批和会话走 DSH 进程内 API；手机只通过 Tailscale 访问本机 `/dispatch/*`。
+
+## 你能得到什么
+
+| 能力 | 怎么用 | 要不要 ntfy |
+|---|---|---|
+| 看回复 / 续聊 / 新开会话 | 手机浏览器打开 `/dispatch/chat?token=…` | 否 |
+| 批准 / 拒绝提权 | 同一会话页顶上的横幅按钮 | 否 |
+| 锁屏弹通知、点【批准】【拒绝】 | 手机装 ntfy，订阅安装脚本打印的主题 | 可选 |
+
+最低配置：**电脑有 DSH + PC/手机同一 Tailscale 账号 + 系统浏览器**。
+
+## 安装（Windows）
+
+1. 本机已能打开 DeepSeek Harness Web（默认 `http://127.0.0.1:3080`）。
+2. 克隆本仓库，在仓库根目录：
+
+   ```powershell
+   pwsh -File install.ps1
+   ```
+
+3. **重启** DeepSeek Harness。
+4. 打开 `http://127.0.0.1:3080/dispatch/health`，应看到 `{"ok":true,...}`。
+5. 脚本结束时会打印：
+   - 手机会话页 URL（含 token）
+   - 可选的 ntfy 主题名  
+
+   把会话页加到手机浏览器书签即可。
+
+`install.ps1` 会：
+
+- 把 `plugin/` 拷进 `.dsh-home/profiles/web/node_modules/dsh-dispatch`
+- 若 `cordis.patch.yml` 还没有本插件，就追加一段（**现场生成** token 和随机主题）
+- 若已装 Tailscale，尝试 `tailscale serve --bg --https=443 http://127.0.0.1:3080`
+
+**不要把 `cordis.patch.yml` 提交到 git**，里面是这台机器的钥匙。
+
+第三方安装包**不要**提交到 git（许可证、签名、体积）。克隆后可运行 `pwsh -File vendor/fetch-official.ps1` 从官方源拉 Tailscale Windows MSI，并打开手机端下载页。说明见 [vendor/README.md](vendor/README.md)。
+
+## 手机
+
+1. 安装 [Tailscale](https://tailscale.com/download/android)，登录和电脑**同一个账号**。电池 → 无限制，允许自启动。
+2. 浏览器打开安装脚本打印的会话页。需要审批时页顶会出现【✅ 批准】【❌ 拒绝】。
+3. （可选）再装 [ntfy](https://ntfy.sh)，订阅脚本打印的主题，服务器保持 `https://ntfy.sh`，打开该订阅的**即时传递**。锁屏才会主动弹。不装也能从会话页批权限。
+
+详见 [docs/手机端配置指南.md](docs/手机端配置指南.md)。把本仓库发给别人见 [分发说明.md](分发说明.md)。
+
+## 仓库结构
+
+```
+plugin/                 唯一运行时代码（Cordis Service）
+install.ps1             一键安装（推荐给使用者）
+deploy.ps1              改完源码后同步到本机 profile 并保留配置
+verify.ps1              重启后冒烟（health / 鉴权）
+pack.ps1                打可分享 zip 到 dist/（不进 git）
+docs/                   手机配置、快捷指令、设计笔记
+```
+
+## 工作原理
+
+插件以进程内客户端连进 DSH 的 mux / host 流：
+
+- `approval/requested` → 可选 ntfy 推送；会话页同时画审批横幅
+- 手机点批准 → `/dispatch/decision` 或会话页 `?decide=` → `respond()` 注入决策  
+  与网页 GUI 平级，先答先赢
+- `POST /dispatch/task` 或会话页表单 → `sessions.create` + `sessions.prompt`
+- 一轮结束 → 推「✅ 任务完成」（可点【打开会话】）
+
+路由都在 `/dispatch/*`，**不走** `/api` 信任栅栏，token 就是鉴权。
+
+针对 ntfy.sh 走 HTTP/80 时的中间盒：JSON 非 ASCII 转成 `\uXXXX`；`priority` 用数字 `4`/`5`，不要用字符串 `"high"`。
+
+## 开发
+
+改 `plugin/lib/index.js` 后：
+
+```powershell
+pwsh -File deploy.ps1
+```
+
+然后重启 DeepSeek Harness。`deploy.ps1` 只覆盖插件文件，不改 token。
+
+要求：DeepSeek Harness **0.1.0-rc.6** 附近（`webServer` + `apiProxy` + `InProcessApiClient`）。
+
+## 安全
+
+- token 出现在会话页 URL 和 ntfy 动作链接里，等同口令。泄露就在 `cordis.patch.yml` 里换掉并重启。
+- ntfy 公共主题靠随机名保密，不要把主题发到公开 issue。
+- Tailscale 把 3080 留在回环，手机走 `*.ts.net` HTTPS，不要把 3080 绑到公网。
+
+## License
+
+MIT

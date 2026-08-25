@@ -1,0 +1,8 @@
+{
+  "name": "dsh-dispatch",
+  "description": "Phone dispatch + lock-screen approval bridge for DeepSeek Harness (dsh-dispatch)",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "lib/index.js",
+  "license": "MIT"
+}
