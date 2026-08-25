@@ -28,7 +28,8 @@ import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 
 const OUTCOMES = new Set(['allowed-once', 'rejected'])
-const MAX_BODY = 1024 * 1024
+const MAX_BODY = 12 * 1024 * 1024
+const IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif'])
 
 export class DispatchService extends Service {
 	static inject = ['webServer', 'apiProxy']
@@ -304,7 +305,7 @@ export class DispatchService extends Service {
 		})
 	}
 
-	readBody(req) {
+	readRaw(req) {
 		return new Promise((resolve, reject) => {
 			let size = 0
 			const chunks = []
@@ -313,9 +314,13 @@ export class DispatchService extends Service {
 				if (size > MAX_BODY) { reject(new Error('body too large')); req.destroy(); return }
 				chunks.push(chunk)
 			})
-			req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
+			req.on('end', () => resolve(Buffer.concat(chunks)))
 			req.on('error', reject)
 		})
+	}
+
+	readBody(req) {
+		return this.readRaw(req).then((buf) => buf.toString('utf8'))
 	}
 
 	sendJson(res, status, obj) {
@@ -360,6 +365,94 @@ export class DispatchService extends Service {
 		}).filter(Boolean).join('\n').trim()
 	}
 
+	blocksImages(blocks) {
+		const images = []
+		if (!Array.isArray(blocks)) return images
+		for (const b of blocks) {
+			if (!b || typeof b !== 'object') continue
+			if (b.type !== 'image' && b.type !== 'image_url') continue
+			const mediaType = b.mediaType || b.media_type || 'image/jpeg'
+			if (b.attachmentId) images.push({ attachmentId: b.attachmentId, mediaType })
+			else if (typeof b.data === 'string' && b.data) images.push({ data: b.data.replace(/^data:[^;]+;base64,/, ''), mediaType })
+		}
+		return images
+	}
+
+	imgPath(sessionId, attachmentId) {
+		const qs = new URLSearchParams({ token: this.config.token })
+		return `/dispatch/chat/${encodeURIComponent(sessionId)}/img/${encodeURIComponent(attachmentId)}?${qs.toString()}`
+	}
+
+	guessImageType(filename, declared) {
+		const mt = String(declared || '').toLowerCase().split(';')[0].trim()
+		if (IMAGE_TYPES.has(mt)) return mt
+		const n = String(filename || '').toLowerCase()
+		if (n.endsWith('.png')) return 'image/png'
+		if (n.endsWith('.webp')) return 'image/webp'
+		if (n.endsWith('.gif')) return 'image/gif'
+		if (n.endsWith('.jpg') || n.endsWith('.jpeg')) return 'image/jpeg'
+		return ''
+	}
+
+	formImages(fields) {
+		const out = []
+		for (const f of fields.files ?? []) {
+			const mediaType = this.guessImageType(f.filename, f.mediaType)
+			if (!mediaType || !f.data?.length) continue
+			out.push({
+				type: 'image',
+				mediaType,
+				data: Buffer.isBuffer(f.data) ? f.data.toString('base64') : String(f.data),
+				name: f.filename || 'image'
+			})
+		}
+		return out.slice(0, 4)
+	}
+
+	parseMultipart(buf, boundary) {
+		const out = { files: [] }
+		if (!boundary) return out
+		const start = Buffer.from('--' + boundary + '\r\n')
+		const delim = Buffer.from('\r\n--' + boundary)
+		let i = buf.indexOf(start)
+		if (i < 0) return out
+		i += start.length
+		while (i < buf.length) {
+			const next = buf.indexOf(delim, i)
+			const part = buf.subarray(i, next >= 0 ? next : buf.length)
+			const headerEnd = part.indexOf(Buffer.from('\r\n\r\n'))
+			if (headerEnd >= 0) {
+				const headers = part.subarray(0, headerEnd).toString('utf8')
+				let body = part.subarray(headerEnd + 4)
+				if (body.length >= 2 && body[body.length - 2] === 13 && body[body.length - 1] === 10) {
+					body = body.subarray(0, body.length - 2)
+				}
+				const nameM = headers.match(/name="([^"]+)"/i)
+				const fileM = headers.match(/filename="([^"]*)"/i)
+				const typeM = headers.match(/Content-Type:\s*([^\r\n]+)/i)
+				const name = nameM?.[1]
+				if (name && fileM) {
+					out.files.push({ field: name, filename: fileM[1], mediaType: (typeM?.[1] || '').trim(), data: body })
+				} else if (name) {
+					out[name] = body.toString('utf8')
+				}
+			}
+			if (next < 0) break
+			i = next + delim.length
+			if (buf[i] === 13 && buf[i + 1] === 10) i += 2
+			if (buf[i] === 45 && buf[i + 1] === 45) break
+		}
+		return out
+	}
+
+	promptContent(text, images) {
+		const content = []
+		if (text) content.push({ type: 'text', text })
+		else if (images.length) content.push({ type: 'text', text: '（图片）' })
+		for (const img of images) content.push(img)
+		return content
+	}
+
 	visibleAssistantText(raw) {
 		const stripped = String(raw ?? '')
 			.replace(/<think>[\s\S]*?<\/think>/gi, '')
@@ -377,11 +470,16 @@ export class DispatchService extends Service {
 				const src = ev.data?.source ?? ev.data?.message?.source
 				const kind = src?.kind
 				if (kind && kind !== 'user') continue
-				const text = this.blocksText(ev.data?.content ?? ev.data?.message?.content)
-				if (text && !text.startsWith('/permission ')) out.push({ role: 'user', text, time: ev.time })
+				const blocks = ev.data?.content ?? ev.data?.message?.content
+				const text = this.blocksText(blocks)
+				const images = this.blocksImages(blocks)
+				if (text && text.startsWith('/permission ')) continue
+				if (text || images.length) out.push({ role: 'user', text, images, time: ev.time })
 			} else if (ev.type === 'assistant/message') {
-				const text = this.visibleAssistantText(this.blocksText(ev.data?.message?.content ?? ev.data?.content))
-				if (text) out.push({ role: 'assistant', text, time: ev.time })
+				const blocks = ev.data?.message?.content ?? ev.data?.content
+				const text = this.visibleAssistantText(this.blocksText(blocks))
+				const images = this.blocksImages(blocks)
+				if (text || images.length) out.push({ role: 'assistant', text, images, time: ev.time })
 			}
 		}
 		return out
@@ -470,6 +568,8 @@ export class DispatchService extends Service {
 			'a{color:#8be9fd} header,main,form{max-width:720px;margin:0 auto;padding:12px}',
 			'header{display:flex;gap:12px;align-items:center;border-bottom:1px solid #1c2541}',
 			'.msg{margin:10px 0;padding:10px 12px;border-radius:12px;white-space:pre-wrap;word-break:break-word;line-height:1.45}',
+			'.pic{max-width:100%;border-radius:10px;margin-top:8px;display:block}',
+			'input[type=file]{margin-top:8px;font:inherit;color:#8be9fd}',
 			'.user{background:#1c2541} .assistant{background:#193c3a}',
 			'.meta{opacity:.55;font-size:12px;margin-bottom:4px}',
 			'textarea,input[type=text],select{width:100%;box-sizing:border-box;background:#1c2541;color:#e6f1ff;border:1px solid #3a506b;border-radius:10px;padding:10px;font:inherit}',
@@ -532,6 +632,10 @@ export class DispatchService extends Service {
 			if (route === '/dispatch/task' && req.method === 'POST') return await this.handleTask(req, res)
 			if (route === '/dispatch/chat' && req.method === 'GET') return await this.handleChatList(urlObj, res)
 			if (route === '/dispatch/chat' && req.method === 'POST') return await this.handleChatNew(req, urlObj, res)
+			const imgMatch = route.match(/^\/dispatch\/chat\/([^/]+)\/img\/([^/]+)$/)
+			if (imgMatch && req.method === 'GET') {
+				return await this.handleChatImage(decodeURIComponent(imgMatch[1]), decodeURIComponent(imgMatch[2]), res)
+			}
 			if (route.startsWith('/dispatch/chat/') && req.method === 'GET') {
 				return await this.handleChatView(route.slice('/dispatch/chat/'.length), urlObj, res)
 			}
@@ -630,8 +734,9 @@ export class DispatchService extends Service {
 			'<option value="' + id + '"' + (id === 'workspace-write' ? ' selected' : '') + '>' + this.escHtml(this.permissionLabel(id)) + '</option>'
 		).join('')
 		const composer = showArchived ? '' : [
-			'<form method="post" action="' + this.escHtml(this.chatPath()) + '">',
-			'<textarea name="text" rows="3" placeholder="新开一个会话，说你要它干什么…" required></textarea>',
+			'<form method="post" action="' + this.escHtml(this.chatPath()) + '" enctype="multipart/form-data">',
+			'<textarea name="text" rows="3" placeholder="新开一个会话，说你要它干什么…"></textarea>',
+			'<input type="file" name="images" accept="image/jpeg,image/png,image/webp,image/gif" capture="environment" multiple>',
 			'<button type="submit">发送</button>',
 			'<details class="adv"><summary>高级 · 模式 / 权限</summary>',
 			presetOpts,
@@ -654,7 +759,8 @@ export class DispatchService extends Service {
 	async handleChatNew(req, urlObj, res) {
 		const fields = await this.readForm(req, urlObj)
 		const text = (fields.text ?? '').trim()
-		if (!text) return this.sendHtml(res, this.pageShell('dsh', '<main><p>内容不能为空</p></main>'), 400)
+		const images = this.formImages(fields)
+		if (!text && !images.length) return this.sendHtml(res, this.pageShell('dsh', '<main><p>内容不能为空</p></main>'), 400)
 		const createReq = {}
 		const agentPreset = (fields.agentPreset ?? '').trim()
 		if (agentPreset) createReq.agentPreset = agentPreset
@@ -670,11 +776,11 @@ export class DispatchService extends Service {
 		const prompted = await this.client.sessions.prompt({
 			sessionId,
 			mode: 'queue',
-			content: [{ type: 'text', text }]
+			content: this.promptContent(text, images)
 		})
 		if (!prompted.result.ok) return this.sendJson(res, 502, { ok: false, stage: 'prompt', sessionId, error: prompted.result.error })
-		this.note('task', { sessionId, mode: 'queue', text: text.slice(0, 120) })
-		this.trackedTasks.set(sessionId, { snippet: text.slice(0, 80).replace(/\s+/g, ' '), at: Date.now() })
+		this.note('task', { sessionId, mode: 'queue', text: (text || '（图片）').slice(0, 120) })
+		this.trackedTasks.set(sessionId, { snippet: (text || '（图片）').slice(0, 80).replace(/\s+/g, ' '), at: Date.now() })
 		this.log(`chat dispatched → ${sessionId}`)
 		this.redirect(res, this.chatPath(sessionId))
 	}
@@ -724,7 +830,12 @@ export class DispatchService extends Service {
 		const folded = this.foldHistory(hist.result.value.events)
 		const msgs = folded.map((m) => {
 			const who = m.role === 'user' ? '你' : '助手'
-			return `<div class="msg ${m.role}"><div class="meta">${who}</div>${this.escHtml(m.text)}</div>`
+			const pics = (m.images ?? []).map((img) => {
+				if (img.attachmentId) return `<img class="pic" alt="" src="${this.escHtml(this.imgPath(sessionId, img.attachmentId))}">`
+				if (img.data) return `<img class="pic" alt="" src="data:${this.escHtml(img.mediaType || 'image/jpeg')};base64,${img.data}">`
+				return ''
+			}).join('')
+			return `<div class="msg ${m.role}"><div class="meta">${who}</div>${this.escHtml(m.text || '')}${pics}</div>`
 		}).join('') || '<p class="muted">还没有可见消息（可能还在跑工具）</p>'
 		const pendingHere = [...this.pending.entries()].filter(([, e]) => e.sessionId === sessionId)
 		const banners = pendingHere.map(([rpcId, e]) => {
@@ -767,7 +878,7 @@ export class DispatchService extends Service {
 			'}',
 			'document.querySelectorAll("form").forEach(function(f){f.addEventListener("submit",function(){if(f.querySelector("textarea[name=text]"))try{sessionStorage.removeItem(k)}catch(e){}})});',
 			'document.querySelectorAll("details.adv").forEach(function(d){var dk="dsh-adv-"+location.pathname;try{if(sessionStorage.getItem(dk)==="1")d.open=true}catch(e){}d.addEventListener("toggle",function(){try{sessionStorage.setItem(dk,d.open?"1":"0")}catch(e){}})});',
-			waiting ? 'setTimeout(function tick(){if(ta&&(ta.value||"").trim()){setTimeout(tick,4000);return}location.reload()},4000);' : '',
+			waiting ? 'setTimeout(function tick(){var f=document.querySelector("input[type=file]");if((ta&&(ta.value||"").trim())||(f&&f.files&&f.files.length)){setTimeout(tick,4000);return}location.reload()},4000);' : '',
 			'})()</script>'
 		].join('')
 		const archivedSet = await this.archivedIdSet()
@@ -827,8 +938,9 @@ export class DispatchService extends Service {
 		const body = [
 			'<header><a href="' + this.escHtml(this.chatPath()) + '">← 会话列表</a><strong style="margin-left:auto">' + this.escHtml(currentTitle) + '</strong></header>',
 			'<main>', extra, banners, msgs,
-			'<form id="composer" method="post" action="' + this.escHtml(this.chatPath(sessionId)) + '">',
-			'<textarea name="text" rows="3" placeholder="继续说…" required></textarea>',
+			'<form id="composer" method="post" action="' + this.escHtml(this.chatPath(sessionId)) + '" enctype="multipart/form-data">',
+			'<textarea name="text" rows="3" placeholder="继续说…"></textarea>',
+			'<input type="file" name="images" accept="image/jpeg,image/png,image/webp,image/gif" capture="environment" multiple>',
 			'<button type="submit">发送续聊</button></form>',
 			'<details class="adv"><summary>高级 · 模型 / 权限 / 改名</summary>',
 			modelForm, permForm, renameForm,
@@ -843,8 +955,9 @@ export class DispatchService extends Service {
 	async handleChatReply(rawId, req, urlObj, res) {
 		const sessionId = decodeURIComponent(rawId.split('?')[0])
 		const fields = await this.readForm(req, urlObj)
+		const images = this.formImages(fields)
 		const title = (fields.title ?? '').trim()
-		if (title && !(fields.text ?? '').trim()) {
+		if (title && !(fields.text ?? '').trim() && !images.length) {
 			const renamed = await this.client.sessions.rename({ sessionId, title })
 			if (!renamed.result.ok) {
 				return this.sendHtml(res, this.pageShell('改名失败', `<main><p>${this.escHtml(JSON.stringify(renamed.result.error))}</p><p><a href="${this.escHtml(this.chatPath(sessionId))}">返回会话</a></p></main>`), 502)
@@ -853,25 +966,42 @@ export class DispatchService extends Service {
 			return this.redirect(res, this.chatPath(sessionId))
 		}
 		const text = (fields.text ?? '').trim()
-		if (!text) return this.redirect(res, this.chatPath(sessionId))
+		if (!text && !images.length) return this.redirect(res, this.chatPath(sessionId))
 		const prompted = await this.client.sessions.prompt({
 			sessionId,
 			mode: 'queue',
-			content: [{ type: 'text', text }]
+			content: this.promptContent(text, images)
 		})
 		if (!prompted.result.ok) {
 			return this.sendHtml(res, this.pageShell('发送失败', `<main><p>${this.escHtml(JSON.stringify(prompted.result.error))}</p></main>`), 502)
 		}
-		this.note('task', { sessionId, mode: 'queue', text: text.slice(0, 120) })
-		this.trackedTasks.set(sessionId, { snippet: text.slice(0, 80).replace(/\s+/g, ' '), at: Date.now() })
+		this.note('task', { sessionId, mode: 'queue', text: (text || '（图片）').slice(0, 120) })
+		this.trackedTasks.set(sessionId, { snippet: (text || '（图片）').slice(0, 80).replace(/\s+/g, ' '), at: Date.now() })
 		this.log(`chat reply → ${sessionId}`)
 		this.redirect(res, this.chatPath(sessionId) + '&sent=1')
 	}
 
+	async handleChatImage(sessionId, attachmentId, res) {
+		const got = await this.client.sessions.attachment({ sessionId, attachmentId })
+		if (!got.result.ok) return this.sendJson(res, 404, { ok: false, error: got.result.error })
+		const media = got.result.value.attachment?.mediaType || 'image/jpeg'
+		const data = got.result.value.data
+		const buf = Buffer.from(typeof data === 'string' ? data : '', 'base64')
+		res.writeHead(200, { 'Content-Type': media, 'Cache-Control': 'private, max-age=86400' })
+		res.end(buf)
+	}
+
 	async readForm(req, urlObj) {
 		const ctype = String(req.headers['content-type'] ?? '')
-		const raw = await this.readBody(req)
-		const out = {}
+		const rawBuf = await this.readRaw(req)
+		const out = { files: [] }
+		const bound = ctype.match(/boundary=(?:"([^"]+)"|([^;]+))/i)
+		if (bound) {
+			Object.assign(out, this.parseMultipart(rawBuf, (bound[1] || bound[2] || '').trim()))
+			for (const [k, v] of urlObj.searchParams) if (out[k] === undefined) out[k] = v
+			return out
+		}
+		const raw = rawBuf.toString('utf8')
 		if (ctype.includes('application/json')) {
 			try { Object.assign(out, JSON.parse(raw || '{}')) } catch { /* ignore */ }
 			return out
