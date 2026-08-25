@@ -640,14 +640,15 @@ export class DispatchService extends Service {
 			'Promise.all(bag.slice(0,20).map(function(f){return pack(f).catch(function(){return null})})).then(function(imgs){',
 			'imgs=imgs.filter(Boolean);',
 			'if(!imgs.length){alert("图片读不出来，换一张 jpg/png 再试");if(btn){btn.disabled=false;btn.textContent="发送"};form.classList.remove("busy");return}',
+			'try{sessionStorage.removeItem("dsh-draft-"+location.pathname)}catch(e){}',
 			'var body={text:(form.querySelector("textarea[name=text]")||{}).value||"",images:imgs};',
 			'var ap=form.querySelector("[name=agentPreset]");if(ap&&ap.value)body.agentPreset=ap.value;',
 			'var md=form.querySelector("[name=model]");if(md&&md.value)body.model=md.value;',
 			'var pm=form.querySelector("[name=permission]");if(pm&&pm.value)body.permission=pm.value;',
-			'return fetch(form.action,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body),credentials:"same-origin",redirect:"manual"}).then(function(r){',
-			'if(r.status>=400) return r.text().then(function(t){throw new Error(t.slice(0,180)||("HTTP "+r.status))});',
-			'var loc=r.headers.get("Location")||form.action;',
-			'if(loc.indexOf("sent=")<0 && loc.indexOf("/dispatch/chat/")>=0) loc+=(loc.indexOf("?")>=0?"&":"?")+"sent=1";',
+			'return fetch(form.action,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body),credentials:"same-origin"}).then(function(r){',
+			'if(!r.ok) return r.text().then(function(t){throw new Error(t.slice(0,180)||("HTTP "+r.status))});',
+			'var loc=r.url||form.action;',
+			'if(loc.indexOf("/dispatch/chat")>=0 && loc.indexOf("sent=")<0) loc+=(loc.indexOf("?")>=0?"&":"?")+"sent=1";',
 			'location.href=loc',
 			'})})',
 			'.catch(function(e){alert("发送失败："+(e&&e.message||e));if(btn){btn.disabled=false;btn.textContent="发送"};form.classList.remove("busy")})',
@@ -897,7 +898,17 @@ export class DispatchService extends Service {
 		this.note('task', { sessionId, mode: 'queue', text: (text || '（图片）').slice(0, 120) })
 		this.trackedTasks.set(sessionId, { snippet: (text || '（图片）').slice(0, 80).replace(/\s+/g, ' '), at: Date.now() })
 		this.log(`chat dispatched → ${sessionId}`)
-		this.redirect(res, this.chatPath(sessionId))
+		this.redirect(res, this.chatPath(sessionId) + '&sent=1')
+	}
+
+	async sessionRunning(sessionId) {
+		try {
+			const listed = await this.client.sessions.list({})
+			if (!listed.result.ok) return false
+			return Boolean((listed.result.value.items ?? []).find((s) => s.sessionId === sessionId)?.running)
+		} catch {
+			return false
+		}
 	}
 
 	async handleChatView(rawId, urlObj, res) {
@@ -965,9 +976,13 @@ export class DispatchService extends Service {
 				'</p></div>'
 			].join('')
 		}).join('')
-		const waiting = Boolean(urlObj.searchParams.get('sent')) || pendingHere.length > 0
+		const running = await this.sessionRunning(sessionId)
+		const last = folded[folded.length - 1]
+		const awaitingReply = !last || last.role === 'user'
+		const sent = Boolean(urlObj.searchParams.get('sent'))
+		const waiting = pendingHere.length > 0 || running || (sent && awaitingReply)
 		const extra = waiting
-			? '<p class="muted">进行中……有回复或审批变化后会自动刷新。输入框里有字时不会刷新。</p>'
+			? '<p class="muted">进行中……有回复或审批变化后会自动刷新。正在打字或已选未发的图时会暂停刷新。</p>'
 			: ''
 		const draftJs = [
 			'<script>(function(){',
@@ -988,12 +1003,12 @@ export class DispatchService extends Service {
 			'restore();setTimeout(restore,0);',
 			'addEventListener("scroll",function(){try{sessionStorage.setItem(sk,String(scrollY))}catch(e){}});',
 			'if(ta){',
-			'try{var s=sessionStorage.getItem(k);if(s)ta.value=s}catch(e){}',
+			waiting ? '' : 'try{var s=sessionStorage.getItem(k);if(s)ta.value=s}catch(e){}',
 			'ta.addEventListener("input",function(){try{sessionStorage.setItem(k,ta.value)}catch(e){}});',
 			'}',
 			'document.querySelectorAll("form").forEach(function(f){f.addEventListener("submit",function(){if(f.querySelector("textarea[name=text]"))try{sessionStorage.removeItem(k)}catch(e){}})});',
 			'document.querySelectorAll("details.adv").forEach(function(d){var dk="dsh-adv-"+location.pathname;try{if(sessionStorage.getItem(dk)==="1")d.open=true}catch(e){}d.addEventListener("toggle",function(){try{sessionStorage.setItem(dk,d.open?"1":"0")}catch(e){}})});',
-			waiting ? 'setTimeout(function tick(){var f=document.querySelector("input[type=file]");if((ta&&(ta.value||"").trim())||(f&&f.files&&f.files.length)){setTimeout(tick,4000);return}location.reload()},4000);' : '',
+			waiting ? 'setTimeout(function tick(){var typing=ta&&document.activeElement===ta&&(ta.value||"").trim();var bag=document.querySelectorAll(".thumbs img").length;if(typing||bag){setTimeout(tick,4000);return}location.reload()},4000);' : '',
 			'})()</script>'
 		].join('')
 		const archivedSet = await this.archivedIdSet()
