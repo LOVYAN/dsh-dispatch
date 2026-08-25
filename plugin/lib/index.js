@@ -508,10 +508,23 @@ export class DispatchService extends Service {
 			sessionId ? `<p style="margin-top:20px"><a href="${this.escHtml(this.chatPath(sessionId))}" style="color:#8be9fd">打开会话 · 看回复 / 续聊</a></p>` : '')
 	}
 
+	async archivedIdSet() {
+		try {
+			const ws = await this.client.workspace.list({})
+			if (!ws.result.ok) return new Set()
+			return new Set(ws.result.value.archivedSessionIds ?? [])
+		} catch {
+			return new Set()
+		}
+	}
+
 	async handleChatList(_urlObj, res) {
 		const listed = await this.client.sessions.list({})
 		if (!listed.result.ok) return this.sendJson(res, 502, { ok: false, error: listed.result.error })
-		const items = (listed.result.value.items ?? []).filter((s) => !s.blank).slice(0, 30)
+		const archived = await this.archivedIdSet()
+		const items = (listed.result.value.items ?? [])
+			.filter((s) => !s.blank && !archived.has(s.sessionId) && s.origin !== 'subagent')
+			.slice(0, 30)
 		const pendingBySid = new Map()
 		for (const [, e] of this.pending) {
 			pendingBySid.set(e.sessionId, (pendingBySid.get(e.sessionId) ?? 0) + 1)
@@ -591,12 +604,25 @@ export class DispatchService extends Service {
 		const draftJs = [
 			'<script>(function(){',
 			'var k="dsh-draft-"+location.pathname;',
+			'var sk="dsh-scroll-"+location.pathname;',
+			'var nk="dsh-nmsg-"+location.pathname;',
 			'var ta=document.querySelector("textarea[name=text]");',
-			'if(!ta)return;',
+			'var n=document.querySelectorAll(".msg").length;',
+			'var prevN=0;try{prevN=parseInt(sessionStorage.getItem(nk)||"0",10)||0}catch(e){}',
+			'try{sessionStorage.setItem(nk,String(n))}catch(e){}',
+			'function restore(){',
+			'  var grew=n>prevN;',
+			'  if(grew){var last=document.querySelector(".msg:last-of-type");if(last)last.scrollIntoView({block:"end"});return}',
+			'  try{var y=sessionStorage.getItem(sk);if(y)scrollTo(0,parseInt(y,10)||0)}catch(e){}',
+			'}',
+			'restore();setTimeout(restore,0);',
+			'addEventListener("scroll",function(){try{sessionStorage.setItem(sk,String(scrollY))}catch(e){}});',
+			'if(ta){',
 			'try{var s=sessionStorage.getItem(k);if(s)ta.value=s}catch(e){}',
 			'ta.addEventListener("input",function(){try{sessionStorage.setItem(k,ta.value)}catch(e){}});',
+			'}',
 			'document.querySelectorAll("form").forEach(function(f){f.addEventListener("submit",function(){if(f.querySelector("textarea[name=text]"))try{sessionStorage.removeItem(k)}catch(e){}})});',
-			waiting ? 'setTimeout(function tick(){if((ta.value||"").trim()){setTimeout(tick,4000);return}location.reload()},4000);' : '',
+			waiting ? 'setTimeout(function tick(){if(ta&&(ta.value||"").trim()){setTimeout(tick,4000);return}location.reload()},4000);' : '',
 			'})()</script>'
 		].join('')
 		const body = [
