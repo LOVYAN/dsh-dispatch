@@ -24,4 +24,7 @@ $dst = Join-Path $dshHome 'profiles\web\node_modules\dsh-dispatch'
 New-Item -ItemType Directory -Force -Path (Join-Path $dst 'lib') | Out-Null
 Copy-Item (Join-Path $src 'package.json') $dst -Force
 Copy-Item (Join-Path $src 'lib\index.js') (Join-Path $dst 'lib') -Force
+if (Test-Path (Join-Path $src 'cordis.patch.yml')) {
+	Copy-Item (Join-Path $src 'cordis.patch.yml') $dst -Force
+}
 Write-Host "deployed -> $dst"

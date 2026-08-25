@@ -23,6 +23,7 @@ Thumbs.db
 .env
 .env.*
 *.local
+dsh-dispatch.json
 
 # private planning notes (machine-specific)
 PLAN.md

@@ -1,6 +1,6 @@
 # dsh-dispatch
 
-DeepSeek Harness 的宿主插件：用手机给本机 Agent **派任务、看回复、续聊、批权限**。
+DeepSeek Harness 的 **Cordis 插件**：用手机给本机 Agent 派任务、看回复、续聊、批权限。仓库根目录就是插件包（`lib/` + `cordis.patch.yml`）。`.ps1` 只是 Windows 安装器，不是产品本身。
 
 不是再做一个聊天网页套壳。审批和会话走 DSH 进程内 API；手机只通过 Tailscale 访问本机 `/dispatch/*`。
 
@@ -17,9 +17,15 @@ DeepSeek Harness 的宿主插件：用手机给本机 Agent **派任务、看回
 ## 安装（Windows）
 
 1. 本机已能打开 DeepSeek Harness Web（默认 `http://127.0.0.1:3080`）。
-2. 克隆本仓库，在仓库根目录：
+2. 克隆本仓库后任选一种：
 
    ```powershell
+   # A. 官方入口（推荐，和识图插件同一套）
+   dsh plugin --profile web add ./dsh-dispatch
+   ```
+
+   ```powershell
+   # B. 还没有 dsh plugin 命令时
    pwsh -File install.ps1
    ```
 
@@ -31,13 +37,9 @@ DeepSeek Harness 的宿主插件：用手机给本机 Agent **派任务、看回
 
    把会话页加到手机浏览器书签即可。
 
-`install.ps1` 会：
+首次启动把 token / 主题写到 `$DSH_HOME/dsh-dispatch.json`（不要提交）。`install.ps1` 若检测到 Tailscale，会尝试开启 Serve。
 
-- 把 `plugin/` 拷进 `.dsh-home/profiles/web/node_modules/dsh-dispatch`
-- 若 `cordis.patch.yml` 还没有本插件，就追加一段（**现场生成** token 和随机主题）
-- 若已装 Tailscale，尝试 `tailscale serve --bg --https=443 http://127.0.0.1:3080`
-
-**不要把 `cordis.patch.yml` 提交到 git**，里面是这台机器的钥匙。
+**不要把 `dsh-dispatch.json` 或含 token 的 `cordis.patch.yml` 提交到 git。**
 
 第三方安装包**不要**提交到 git（许可证、签名、体积）。克隆后可运行 `pwsh -File vendor/fetch-official.ps1` 从官方源拉 Tailscale Windows MSI，并打开手机端下载页。说明见 [vendor/README.md](vendor/README.md)。
 

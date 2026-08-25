@@ -1,0 +1,11 @@
+# Bundle patch: installing this package (dsh plugin add / pnpm add) inserts
+# the service. Secrets are minted on first boot into $DSH_HOME/dsh-dispatch.json
+# — do not put token/topic here.
+- insert:
+    - id: dsh-dispatch
+      name: dsh-dispatch
+      config:
+        publicBaseUrl: ''
+        ntfyServerUrl: http://ntfy.sh
+        ntfyTopic: ''
+        pushEnabled: true
