@@ -67,6 +67,9 @@ export class DispatchService extends Service {
 		this.hostAbort = null
 		/** sessionId → {snippet, at} for dispatched tasks awaiting a completion push. */
 		this.trackedTasks = new Map()
+		/** sessionId → latest completed turn summary, persisted for voice reads. */
+		this.turnResults = this.loadTurnResults()
+		this.sessionRunningState = new Map()
 		this.client = new InProcessApiClient(toFetchHandler(this.ctx.apiProxy), 120000)
 		this.start()
 	}
@@ -76,6 +79,28 @@ export class DispatchService extends Service {
 	secretsPath() {
 		const home = process.env.DSH_HOME || join(homedir(), '.dsh-home')
 		return join(home, 'dsh-dispatch.json')
+	}
+
+	turnResultsPath() {
+		const home = process.env.DSH_HOME || join(homedir(), '.dsh-home')
+		return join(home, 'dsh-turn-results.json')
+	}
+
+	loadTurnResults() {
+		try {
+			const parsed = JSON.parse(readFileSync(this.turnResultsPath(), 'utf8') || '{}')
+			return new Map(Object.entries(parsed.sessions || {}))
+		} catch { return new Map() }
+	}
+
+	persistTurnResults() {
+		try {
+			const sessions = Object.fromEntries(this.turnResults)
+			mkdirSync(dirname(this.turnResultsPath()), { recursive: true })
+			writeFileSync(this.turnResultsPath(), JSON.stringify({ version: 1, updatedAt: Date.now(), sessions }, null, 2) + '\n', 'utf8')
+		} catch (err) {
+			this.log('could not persist turn results:', err?.message ?? err)
+		}
 	}
 
 	hydrateSecrets(config) {
@@ -191,12 +216,18 @@ export class DispatchService extends Service {
 				for await (const envelope of stream) {
 					const frame = envelope?.payload
 					if (!frame) continue
+					if (frame.type === 'host/session-status') {
+						const wasRunning = this.sessionRunningState.get(frame.sessionId) === true
+						this.sessionRunningState.set(frame.sessionId, Boolean(frame.running))
+						if (frame.running === false && wasRunning) void this.captureTurnResult(frame.sessionId)
+					}
 					if (frame.type === 'host/session-status' && frame.running === false && this.trackedTasks.has(frame.sessionId)) {
 						const info = this.trackedTasks.get(frame.sessionId)
 						this.trackedTasks.delete(frame.sessionId)
 						this.log(`task turn finished → ${frame.sessionId}`)
 						if (this.config.pushEnabled) void this.pushTurnDone(frame.sessionId, info, false)
 					} else if (frame.type === 'host/agent-error' && this.trackedTasks.has(frame.sessionId)) {
+						void this.captureTurnResult(frame.sessionId, { isError: true, error: frame.message })
 						const info = this.trackedTasks.get(frame.sessionId)
 						this.trackedTasks.delete(frame.sessionId)
 						if (this.config.pushEnabled) void this.pushTurnDone(frame.sessionId, info, true, frame.message)
@@ -596,6 +627,68 @@ export class DispatchService extends Service {
 		return ''
 	}
 
+	isSyntheticTurnInstruction(text) {
+		const value = String(text || '').trim()
+		return !value
+			|| /^System restart completed\. Continue the task that was interrupted/i.test(value)
+			|| /^This is an automatically generated checkpoint/i.test(value)
+			|| /^Current runtime context\./i.test(value)
+			|| /^(继续|继续执行|继续吧|接着做)[。！!\s]*$/u.test(value)
+	}
+
+	resultSpeechSummary(raw) {
+		return String(raw || '')
+			.replace(/```[\s\S]*?```/g, ' ')
+			.replace(/`([^`]+)`/g, '$1')
+			.replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
+			.replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+			.replace(/^#{1,6}\s+/gm, '')
+			.replace(/^\s*[-*+]\s+/gm, '')
+			.replace(/^\s*\d+[.)]\s+/gm, '')
+			.replace(/[>*_~|]/g, ' ')
+			.replace(/\s+/g, ' ')
+			.trim()
+			.slice(0, 500)
+	}
+
+	async captureTurnResult(sessionId, { isError = false, error = '' } = {}) {
+		try {
+			const hist = await this.client.sessions.history({ sessionId, maxMessages: 60 })
+			if (!hist.result.ok) throw new Error(hist.result.error || 'history failed')
+			const folded = this.foldHistory(hist.result.value.events)
+			let assistantIndex = -1
+			for (let i = folded.length - 1; i >= 0; i--) {
+				if (folded[i].role === 'assistant' && folded[i].text?.trim()) { assistantIndex = i; break }
+			}
+			let userIndex = -1
+			for (let i = assistantIndex - 1; i >= 0; i--) {
+				if (folded[i].role === 'user' && !this.isSyntheticTurnInstruction(folded[i].text)) { userIndex = i; break }
+			}
+			const previous = this.turnResults.get(sessionId)
+			const result = isError ? String(error || '任务执行失败') : String(folded[assistantIndex]?.text || '').trim()
+			if (!result) return previous || null
+			const record = {
+				sessionId,
+				completedAt: Date.now(),
+				instruction: String(folded[userIndex]?.text || '').slice(0, 2000),
+				result: result.slice(0, 12000),
+				speechSummary: this.resultSpeechSummary(result),
+				isError: Boolean(isError),
+				history: [
+					...(Array.isArray(previous?.history) ? previous.history : []),
+					...(previous?.result ? [{ completedAt: previous.completedAt, instruction: previous.instruction, result: previous.result, isError: previous.isError }] : [])
+				].slice(-4)
+			}
+			this.turnResults.set(sessionId, record)
+			this.persistTurnResults()
+			this.log(`turn result saved → ${sessionId} chars=${record.result.length}`)
+			return record
+		} catch (err) {
+			this.log('turn result capture failed:', sessionId, err?.message ?? err)
+			return this.turnResults.get(sessionId) || null
+		}
+	}
+
 	async pushTurnDone(sessionId, info, isError, errMsg) {
 		const reply = isError ? '' : await this.lastAssistantText(sessionId)
 		const title = isError ? '⚠️ 任务出错' : '✅ 任务完成'
@@ -608,6 +701,35 @@ export class DispatchService extends Service {
 			? [{ action: 'view', label: '打开会话', url: this.chatUrl(sessionId) }]
 			: []
 		await this.push(title, parts.join('\n\n'), actions, sessionId)
+	}
+
+	escJsonScript(s) {
+		return String(s).replace(/</g, '\\u003c')
+	}
+
+	voicePanel(state) {
+		return [
+			'<script type="application/json" id="dsh-voice-state">' + this.escJsonScript(JSON.stringify(state || {})) + '</script>',
+			'<button type="button" id="sts-voice-toggle" class="voice-fab" aria-label="打开语音助手">🎙 语音助手</button>',
+			'<section id="sts-voice-panel" class="voice-float" hidden>',
+			'<div class="voice-float-head"><strong>' + this.escHtml(state?.sessionId ? '当前对话助手' : '全部对话助手') + '</strong><button type="button" id="sts-voice-close" class="voice-close">关闭</button></div>',
+			'<div class="voice-scope">' + this.escHtml(state?.sessionId ? ('默认：' + (state?.title || '当前对话') + '；可明确点名查看其他对话') : '范围：全部对话') + '</div>',
+			'<iframe id="sts-voice-frame" title="悬浮语音助手" allow="microphone; autoplay"></iframe>',
+			'</section>'
+		].join('')
+	}
+
+	voiceJs() {
+		return [
+			'<script>(function(){',
+			'var btn=document.getElementById("sts-voice-toggle");var panel=document.getElementById("sts-voice-panel");var close=document.getElementById("sts-voice-close");var frame=document.getElementById("sts-voice-frame");if(!btn||!panel||!frame)return;',
+			'var state={sessionId:"",token:"",mode:"session"};try{var el=document.getElementById("dsh-voice-state");if(el)state=JSON.parse(el.textContent||"{}")}catch(e){}',
+			'var base="https://"+location.hostname+":8443/";var q=new URLSearchParams({token:state.token||"",mode:state.mode||"session"});if(state.sessionId)q.set("sessionId",state.sessionId);if(state.title)q.set("title",state.title);var voiceUrl=base+"?"+q.toString();frame.src=voiceUrl;',
+			'function closeVoice(){panel.hidden=true;window.__dshVoiceBusy=false;frame.src=voiceUrl}',
+			'btn.addEventListener("click",function(){panel.hidden=false;window.__dshVoiceBusy=true});',
+			'if(close)close.addEventListener("click",closeVoice);',
+			'})()</script>'
+		].join('')
 	}
 
 	sendJs() {
@@ -668,6 +790,7 @@ export class DispatchService extends Service {
 			'body{margin:0;font-family:system-ui,sans-serif;background:#0b132b;color:#e6f1ff}',
 			'a{color:#8be9fd} header,main,form{max-width:720px;margin:0 auto;padding:12px}',
 			'header{display:flex;gap:12px;align-items:center;border-bottom:1px solid #1c2541}',
+			'header.chat-header{position:sticky;top:0;z-index:100;background:rgba(11,19,43,.96);backdrop-filter:blur(10px);box-sizing:border-box;box-shadow:0 4px 14px rgba(0,0,0,.28)}',
 			'.msg{margin:10px 0;padding:10px 12px;border-radius:12px;white-space:pre-wrap;word-break:break-word;line-height:1.45}',
 			'.pic{max-width:100%;border-radius:10px;margin-top:8px;display:block}',
 			'.thumbs{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}',
@@ -684,6 +807,19 @@ export class DispatchService extends Service {
 			'.banner form{display:flex;gap:8px;padding:0;margin:8px 0 0}',
 			'.banner button{margin:0}',
 			'.deny{background:#6c757d}',
+			'#voice-bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:8px 0 12px;padding:10px 12px;background:#111a33;border:1px solid #3a506b;border-radius:12px}',
+			'#voice-bar button{margin:0}',
+			'#voice-bar.live{border-color:#3a86ff}',
+			'#voice-bar.listen{border-color:#22a06b}',
+			'#voice-bar.speak{border-color:#e09f3e}',
+			'#voice-status{flex:1;min-width:12em}',
+			'.voice-fab{position:fixed;right:16px;bottom:max(16px,env(safe-area-inset-bottom));z-index:900;margin:0;border-radius:999px;box-shadow:0 8px 28px rgba(0,0,0,.45)}',
+			'.voice-float{position:fixed;right:12px;bottom:76px;z-index:950;width:min(390px,calc(100vw - 24px));height:min(620px,72vh);background:#0b132b;border:1px solid #3a506b;border-radius:18px;overflow:hidden;box-shadow:0 18px 60px rgba(0,0,0,.6)}',
+			'.voice-float-head{height:46px;display:flex;align-items:center;gap:10px;padding:0 10px 0 14px;background:#111a33;border-bottom:1px solid #1c2541}',
+			'.voice-float-head .voice-close{margin:0 0 0 auto;padding:7px 12px;background:#1c2541}',
+			'.voice-scope{height:34px;box-sizing:border-box;padding:8px 12px;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#8be9fd;background:#0e1832}',
+			'.voice-float iframe{display:block;border:0;width:100%;height:calc(100% - 80px);background:#0b132b}',
+			'@media(max-width:520px){.voice-float{left:8px;right:8px;bottom:72px;width:auto;height:72vh}.voice-fab{right:12px}}',
 			'details.adv{margin:12px 0;border:1px solid #1c2541;border-radius:12px;padding:4px 12px 8px;background:#111a33}',
 			'details.adv>summary{cursor:pointer;list-style:none;padding:10px 0;color:#8be9fd}',
 			'details.adv>summary::-webkit-details-marker{display:none}',
@@ -731,6 +867,61 @@ export class DispatchService extends Service {
 					pending: [...this.pending.entries()].map(([rpcId, e]) => ({ rpcId, ...e })),
 					recent: this.events.slice(-20)
 				})
+			}
+			const resultMatch = route.match(/^\/dispatch\/session-result\/([^/]+)$/)
+			if (resultMatch && req.method === 'GET') {
+				const sessionId = decodeURIComponent(resultMatch[1])
+				let record = this.turnResults.get(sessionId)
+				if (!record) {
+					record = await this.captureTurnResult(sessionId)
+					if (record) record = { ...record, backfilled: true }
+				} else if (!record.speechSummary && record.result) {
+					record = { ...record, speechSummary: this.resultSpeechSummary(record.result) }
+					this.turnResults.set(sessionId, record)
+					this.persistTurnResults()
+				}
+				let title = sessionId.slice(-12)
+				try {
+					const listed = await this.client.sessions.list({})
+					const row = listed.result.ok ? (listed.result.value.items ?? []).find((s) => s.sessionId === sessionId) : null
+					if (row) title = this.sessionTitleOf(row)
+				} catch { /* fallback */ }
+				return this.sendJson(res, 200, { ok: true, sessionId, title, result: record || null })
+			}
+			if (route === '/dispatch/sessions' && req.method === 'GET') {
+				const listed = await this.client.sessions.list({})
+				if (!listed.result.ok) return this.sendJson(res, 502, { ok: false, error: listed.result.error })
+				let archived = new Set()
+				try {
+					const workspace = await this.client.workspace.list({})
+					if (workspace.result.ok) archived = new Set(workspace.result.value.archivedSessionIds ?? [])
+				} catch { /* optional */ }
+				const parentBySid = new Map()
+				for (const s of listed.result.value.items ?? []) {
+					if (s.origin === 'subagent' && s.parentSessionId) parentBySid.set(s.sessionId, s.parentSessionId)
+				}
+				const rootOf = (sessionId) => {
+					let id = sessionId
+					const seen = new Set()
+					while (parentBySid.has(id) && !seen.has(id)) { seen.add(id); id = parentBySid.get(id) }
+					return id
+				}
+				const pendingByRoot = new Map()
+				for (const [, e] of this.pending) {
+					const root = rootOf(e.sessionId)
+					pendingByRoot.set(root, (pendingByRoot.get(root) ?? 0) + 1)
+				}
+				const sessions = (listed.result.value.items ?? [])
+					.filter((s) => !s.blank && s.origin !== 'subagent')
+					.map((s) => ({
+						sessionId: s.sessionId,
+						title: this.sessionTitleOf(s),
+						running: Boolean(s.running),
+						pending: pendingByRoot.get(s.sessionId) ?? 0,
+						archived: archived.has(s.sessionId),
+						updatedAt: s.updatedAt ?? 0
+					}))
+				return this.sendJson(res, 200, { ok: true, sessions })
 			}
 			if (route === '/dispatch/decision') return await this.handleDecision(urlObj, res)
 			if (route === '/dispatch/task' && req.method === 'POST') return await this.handleTask(req, res)
@@ -807,9 +998,23 @@ export class DispatchService extends Service {
 		const live = all.filter((s) => !archived.has(s.sessionId))
 		const archivedRows = all.filter((s) => archived.has(s.sessionId))
 		const items = (showArchived ? archivedRows : live).slice(0, 40)
+		const parentBySid = new Map()
+		for (const s of listed.result.value.items ?? []) {
+			if (s.origin === 'subagent' && s.parentSessionId) parentBySid.set(s.sessionId, s.parentSessionId)
+		}
+		const rootOf = (sessionId) => {
+			let id = sessionId
+			const seen = new Set()
+			while (parentBySid.has(id) && !seen.has(id)) {
+				seen.add(id)
+				id = parentBySid.get(id)
+			}
+			return id
+		}
 		const pendingBySid = new Map()
 		for (const [, e] of this.pending) {
-			pendingBySid.set(e.sessionId, (pendingBySid.get(e.sessionId) ?? 0) + 1)
+			const root = rootOf(e.sessionId)
+			pendingBySid.set(root, (pendingBySid.get(root) ?? 0) + 1)
 		}
 		const rows = items.map((s) => {
 			const href = this.chatPath(s.sessionId)
@@ -849,7 +1054,7 @@ export class DispatchService extends Service {
 			'<textarea name="text" rows="3" placeholder="新开一个会话，说你要它干什么…"></textarea>',
 			'<input type="file" name="images" accept="image/jpeg,image/png,image/webp,image/gif" multiple>',
 			'<div class="thumbs"></div><p class="muted img-hint">点选图，再选会追加，最多 20 张</p>',
-			'<button type="submit">发送</button>',
+			'<div class="composer-actions"><button type="submit">发送</button></div>',
 			'<details class="adv"><summary>高级 · 模型 / 模式 / 权限</summary>',
 			modelOpts,
 			presetOpts,
@@ -861,9 +1066,10 @@ export class DispatchService extends Service {
 		const advJs = '<script>(function(){document.querySelectorAll("details.adv").forEach(function(d){var dk="dsh-adv-"+location.pathname;try{if(sessionStorage.getItem(dk)==="1")d.open=true}catch(e){}d.addEventListener("toggle",function(){try{sessionStorage.setItem(dk,d.open?"1":"0")}catch(e){}})})})()</script>'
 		const body = [
 			'<header><strong>' + heading + '</strong></header><main>',
+			showArchived ? '' : this.voicePanel({ token: this.config.token, mode: 'global' }),
 			nav, composer,
 			rows || '<p class="muted">' + empty + '</p>',
-			advJs, this.sendJs(),
+			advJs, this.sendJs(), showArchived ? '' : this.voiceJs(),
 			'</main>'
 		].join('')
 		this.sendHtml(res, this.pageShell(heading, body))
@@ -925,7 +1131,8 @@ export class DispatchService extends Service {
 		const decideRpc = urlObj.searchParams.get('decide')
 		const decideOut = urlObj.searchParams.get('outcome')
 		if (decideRpc && OUTCOMES.has(decideOut ?? '')) {
-			await this.applyDecision(decideRpc, decideOut, sessionId, this.pending.get(decideRpc)?.approvalId ?? '')
+			const entry = this.pending.get(decideRpc)
+			if (entry) await this.applyDecision(decideRpc, decideOut, entry.sessionId, entry.approvalId)
 			return this.redirect(res, this.chatPath(sessionId))
 		}
 		const switchModel = urlObj.searchParams.get('switchModel')
@@ -963,12 +1170,35 @@ export class DispatchService extends Service {
 			}).join('')
 			return `<div class="msg ${m.role}"><div class="meta">${who}</div>${this.escHtml(m.text || '')}${pics}</div>`
 		}).join('') || '<p class="muted">还没有可见消息（可能还在跑工具）</p>'
-		const pendingHere = [...this.pending.entries()].filter(([, e]) => e.sessionId === sessionId)
+		const listedForTree = await this.client.sessions.list({})
+		const summaries = listedForTree.result.ok ? (listedForTree.result.value.items ?? []) : []
+		const children = new Map()
+		for (const s of summaries) {
+			if (s.origin !== 'subagent' || !s.parentSessionId) continue
+			const row = children.get(s.parentSessionId) ?? []
+			row.push(s.sessionId)
+			children.set(s.parentSessionId, row)
+		}
+		const sessionTree = new Set([sessionId])
+		const queue = [sessionId]
+		while (queue.length) {
+			const parent = queue.shift()
+			for (const child of children.get(parent) ?? []) {
+				if (sessionTree.has(child)) continue
+				sessionTree.add(child)
+				queue.push(child)
+			}
+		}
+		const summaryById = new Map(summaries.map((s) => [s.sessionId, s]))
+		const pendingHere = [...this.pending.entries()].filter(([, e]) => sessionTree.has(e.sessionId))
 		const banners = pendingHere.map(([rpcId, e]) => {
 			const allow = this.chatPath(sessionId) + '&decide=' + encodeURIComponent(rpcId) + '&outcome=allowed-once'
 			const deny = this.chatPath(sessionId) + '&decide=' + encodeURIComponent(rpcId) + '&outcome=rejected'
+			const child = e.sessionId !== sessionId
+			const source = child ? (this.sessionTitleOf(summaryById.get(e.sessionId)) || e.sessionId.slice(-12)) : '当前主会话'
 			return [
 				'<div class="banner"><strong>需要审批 · ' + this.escHtml(e.toolName) + '</strong>',
+				'<div class="muted">来源：' + this.escHtml(source) + (child ? ' · 子任务' : '') + '</div>',
 				'<div class="muted">' + this.escHtml((e.reason || '').slice(0, 400)) + '</div>',
 				'<p style="margin:10px 0 0;display:flex;gap:8px;flex-wrap:wrap">',
 				'<a href="' + this.escHtml(allow) + '" style="display:inline-block;background:#3a86ff;color:#fff;text-decoration:none;border-radius:10px;padding:10px 16px">✅ 批准</a>',
@@ -1008,7 +1238,7 @@ export class DispatchService extends Service {
 			'}',
 			'document.querySelectorAll("form").forEach(function(f){f.addEventListener("submit",function(){if(f.querySelector("textarea[name=text]"))try{sessionStorage.removeItem(k)}catch(e){}})});',
 			'document.querySelectorAll("details.adv").forEach(function(d){var dk="dsh-adv-"+location.pathname;try{if(sessionStorage.getItem(dk)==="1")d.open=true}catch(e){}d.addEventListener("toggle",function(){try{sessionStorage.setItem(dk,d.open?"1":"0")}catch(e){}})});',
-			waiting ? 'setTimeout(function tick(){var typing=ta&&document.activeElement===ta&&(ta.value||"").trim();var bag=document.querySelectorAll(".thumbs img").length;if(typing||bag){setTimeout(tick,4000);return}location.reload()},4000);' : '',
+			waiting ? 'setTimeout(function tick(){var typing=ta&&document.activeElement===ta&&(ta.value||"").trim();var bag=document.querySelectorAll(".thumbs img").length;if(typing||bag||window.__dshVoiceBusy){setTimeout(tick,4000);return}location.reload()},4000);' : '',
 			'})()</script>'
 		].join('')
 		const archivedSet = await this.archivedIdSet()
@@ -1065,19 +1295,22 @@ export class DispatchService extends Service {
 			'<input type="text" name="title" value="' + this.escHtml(currentTitle) + '" maxlength="80" required>',
 			'<button type="submit">改名</button></form>'
 		].join('')
+		const lastAssistant = last?.role === 'assistant' ? String(last.text || '').slice(0, 2500) : ''
 		const body = [
-			'<header><a href="' + this.escHtml(this.chatPath()) + '">← 会话列表</a><strong style="margin-left:auto">' + this.escHtml(currentTitle) + '</strong></header>',
-			'<main>', extra, banners, msgs,
+			'<header class="chat-header"><a href="' + this.escHtml(this.chatPath()) + '">← 会话列表</a><strong style="margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + this.escHtml(currentTitle) + '</strong></header>',
+			'<main>', extra, banners,
+			this.voicePanel({ sessionId, title: currentTitle, token: this.config.token, mode: 'session' }),
+			msgs,
 			'<form id="composer" class="js-chat" method="post" action="' + this.escHtml(this.chatPath(sessionId)) + '" enctype="multipart/form-data">',
 			'<textarea name="text" rows="3" placeholder="继续说…"></textarea>',
 			'<input type="file" name="images" accept="image/jpeg,image/png,image/webp,image/gif" multiple>',
 			'<div class="thumbs"></div><p class="muted img-hint">点选图，再选会追加，最多 20 张</p>',
-			'<button type="submit">发送续聊</button></form>',
+			'<div class="composer-actions"><button type="submit">发送续聊</button></div></form>',
 			'<details class="adv"><summary>高级 · 模型 / 权限 / 改名</summary>',
 			modelForm, permForm, renameForm,
 			'<p class="muted">' + archiveLink + '</p>',
 			'</details>',
-			draftJs, this.sendJs(),
+			draftJs, this.sendJs(), this.voiceJs(),
 			'</main>'
 		].join('')
 		this.sendHtml(res, this.pageShell(currentTitle, body))

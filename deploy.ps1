@@ -1,4 +1,4 @@
-# 把 plugin/ 同步到本机 DSH profile（不改 token / 主题）
+﻿# 把 plugin/ 同步到本机 DSH profile（不改 token / 主题）
 # 用法：pwsh -File deploy.ps1   然后重启 DeepSeek Harness
 $ErrorActionPreference = 'Stop'
 $src = Join-Path $PSScriptRoot 'plugin'
@@ -28,3 +28,16 @@ if (Test-Path (Join-Path $src 'cordis.patch.yml')) {
 	Copy-Item (Join-Path $src 'cordis.patch.yml') $dst -Force
 }
 Write-Host "deployed -> $dst"
+
+$voiceSrc = Join-Path $PSScriptRoot 'voice-gateway'
+if (Test-Path (Join-Path $voiceSrc 'src\server.js')) {
+	$voiceDst = Join-Path $dshHome 'services\dsh-voice-gateway'
+	New-Item -ItemType Directory -Force $voiceDst | Out-Null
+	Copy-Item (Join-Path $voiceSrc '*') $voiceDst -Recurse -Force
+	if (!(Test-Path (Join-Path $voiceDst 'node_modules\ws'))) {
+		& npm install --omit=dev --prefix $voiceDst
+		if ($LASTEXITCODE -ne 0) { throw "语音网关 npm install 失败：$LASTEXITCODE" }
+	}
+	Write-Host "voice deployed -> $voiceDst"
+	Write-Host "语音配置仍在 $(Join-Path $dshHome 'dsh-voice.json')，未覆盖。"
+}

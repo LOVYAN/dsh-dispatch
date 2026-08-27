@@ -1,0 +1,7 @@
+node_modules/
+.env
+.env.*
+*.local.json
+dsh-voice.json
+dsh-voice-foreman.json
+豆包.txt

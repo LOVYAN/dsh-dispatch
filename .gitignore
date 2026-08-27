@@ -24,6 +24,10 @@ Thumbs.db
 .env.*
 *.local
 dsh-dispatch.json
+dsh-voice.json
+dsh-voice-foreman.json
+voice-gateway/node_modules/
+voice-gateway/*.local.json
 
 # private planning notes (machine-specific)
 PLAN.md

@@ -10,6 +10,7 @@ DeepSeek Harness 的 **Cordis 插件**：用手机给本机 Agent 派任务、�
 |---|---|---|
 | 看回复 / 续聊 / 新开会话 | 手机浏览器打开 `/dispatch/chat?token=…` | 否 |
 | 批准 / 拒绝提权 | 同一会话页顶上的横幅按钮 | 否 |
+| 豆包实时语音对谈、读结果、确认后派单 | 独立 `voice-gateway/`，默认 3091 | 否 |
 | 锁屏弹通知、点【批准】【拒绝】 | 手机装 ntfy，订阅安装脚本打印的主题 | 可选 |
 
 最低配置：**电脑有 DSH + PC/手机同一 Tailscale 账号 + 系统浏览器**。
@@ -29,8 +30,15 @@ DeepSeek Harness 的 **Cordis 插件**：用手机给本机 Agent 派任务、�
    pwsh -File install.ps1
    ```
 
-3. **重启** DeepSeek Harness。
-4. 打开 `http://127.0.0.1:3080/dispatch/health`，应看到 `{"ok":true,...}`。
+3. 如需同时配置豆包语音，可直接传 API Key：
+
+   ```powershell
+   pwsh -File install.ps1 -VolcApiKey "你的 X-Api-Key"
+   ```
+
+   不传参数时安装器会安全提示输入；配置只写入 `$DSH_HOME/dsh-voice.json`。部分火山账号若要求 App ID/Resource ID，可用 `-VolcAppId`、`-VolcResourceId`，或安装后编辑本机配置。
+4. **重启** DeepSeek Harness，并运行 `pwsh -File start-voice.ps1` 启动独立 3091 网关。
+5. 打开 `http://127.0.0.1:3080/dispatch/health` 和 `http://127.0.0.1:3091/health`，都应返回健康状态。
 5. 脚本结束时会打印：
    - 手机会话页 URL（含 token）
    - 可选的 ntfy 主题名  
@@ -54,10 +62,13 @@ DeepSeek Harness 的 **Cordis 插件**：用手机给本机 Agent 派任务、�
 ## 仓库结构
 
 ```
-plugin/                 唯一运行时代码（Cordis Service）
-install.ps1             一键安装（推荐给使用者）
-deploy.ps1              改完源码后同步到本机 profile 并保留配置
+plugin/                 DSH Cordis 插件运行代码
+voice-gateway/           独立豆包 SeedDuplex STS 网关源码
+install.ps1             一键安装插件和语音网关
+start-voice.ps1          启动本机独立 3091 服务
+deploy.ps1              同步插件/语音源码，保留本机密钥
 verify.ps1              重启后冒烟（health / 鉴权）
+sync-github.ps1         脱敏检查后 commit/push
 pack.ps1                打可分享 zip 到 dist/（不进 git）
 docs/                   手机配置、快捷指令、设计笔记
 ```
@@ -88,9 +99,31 @@ pwsh -File deploy.ps1
 
 要求：DeepSeek Harness **0.1.0-rc.6** 附近（`webServer` + `apiProxy` + `InProcessApiClient`）。
 
+## 同步到 GitHub
+
+在仓库根目录运行（Windows PowerShell 5 也可用）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\sync-github.ps1 -Message "feat: update voice gateway"
+```
+
+安装了 PowerShell 7 时也可以：
+
+```powershell
+pwsh -File .\sync-github.ps1 -Message "feat: update voice gateway"
+```
+
+只提交、不推送：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\sync-github.ps1 -NoPush
+```
+
+脚本会在 `git add/commit/push` 前检查真实 API Key、token、私有 Tailscale 域名、本机绝对路径、日志和音频文件。
+
 ## 安全
 
-- token 出现在会话页 URL 和 ntfy 动作链接里，等同口令。泄露就在 `cordis.patch.yml` 里换掉并重启。
+- token 出现在会话页 URL 和 ntfy 动作链接里，等同口令。泄露后应轮换本机 `$DSH_HOME/dsh-dispatch.json` 中的 token 并重启。
 - ntfy 公共主题靠随机名保密，不要把主题发到公开 issue。
 - Tailscale 把 3080 留在回环，手机走 `*.ts.net` HTTPS，不要把 3080 绑到公网。
 

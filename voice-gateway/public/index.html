@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+	<title>DSH 语音工头</title>
+	<style>
+		:root { color-scheme: dark; }
+		body { margin: 0; font-family: system-ui, sans-serif; background: #0b132b; color: #e6f1ff;
+			min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
+		main { width: min(420px, 100%); text-align: center; }
+		h1 { font-size: 20px; font-weight: 600; margin: 0 0 8px; }
+		.sub { opacity: .65; font-size: 13px; margin: 0 0 28px; }
+		#state { font-size: 28px; margin: 0 0 8px; }
+		#preview { min-height: 3em; opacity: .75; font-size: 14px; }
+		button { appearance: none; border: 0; border-radius: 999px; padding: 16px 28px; font-size: 16px;
+			background: #3a86ff; color: #fff; margin: 8px; }
+		button.ghost { background: #1c2541; }
+		button:disabled { opacity: .4; }
+		.row { display: flex; justify-content: center; flex-wrap: wrap; }
+		a { color: #8be9fd; }
+	</style>
+</head>
+<body>
+	<main>
+		<h1>DeepSeek Harness 语音工头</h1>
+		<p class="sub" id="binding">先对谈整理计划，你说「去派单」才交给电脑。</p>
+		<p id="state">未接通</p>
+		<p id="preview"></p>
+		<p class="sub" id="dbg"></p>
+		<div id="meter" style="height:8px;background:#1c2541;border-radius:99px;overflow:hidden;margin:12px auto;max-width:240px">
+			<div id="meterBar" style="height:100%;width:0;background:#50fa7b"></div>
+		</div>
+		<div class="row">
+			<button id="call" type="button">接通</button>
+			<button id="hang" class="ghost" type="button" disabled>挂断</button>
+		</div>
+		<p class="sub" id="health"></p>
+	</main>
+	<script src="./app.js" defer></script>
+</body>
+</html>
