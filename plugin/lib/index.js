@@ -58,6 +58,8 @@ export class DispatchService extends Service {
 		this.pending = new Map()
 		/** 稳定键 `${sessionId}/${approvalId}` → rpcId（用于 resolved 清理与去重） */
 		this.pendingByKey = new Map()
+		/** question rpcId → {sessionId, questions, at}；与权限审批严格分离。 */
+		this.pendingQuestions = new Map()
 		/** Seen frame rpcIds (replay dedupe), capped FIFO. */
 		this.seen = new Set()
 		this.seenOrder = []
@@ -195,6 +197,14 @@ export class DispatchService extends Service {
 							this.pending.delete(staleRpc)
 							this.pendingByKey.delete(key)
 							this.note('resolved-elsewhere', { sessionId: frame.sessionId, approvalId: frame.approvalId, outcome: frame.outcome })
+						}
+					} else if (frame && frame.type === 'question/requested') {
+						this.pendingQuestions.set(envelope.rpcId, { sessionId: frame.sessionId, questions: frame.questions, at: Date.now() })
+						this.note('question-requested', { rpcId: envelope.rpcId, sessionId: frame.sessionId, count: frame.questions.length })
+						this.log(`question requested session=${frame.sessionId} count=${frame.questions.length}`)
+					} else if (frame && frame.type === 'question/resolved') {
+						if (this.pendingQuestions.delete(frame.questionRpcId)) {
+							this.note('question-resolved-elsewhere', { rpcId: frame.questionRpcId, sessionId: frame.sessionId, outcome: frame.outcome })
 						}
 					}
 				}
@@ -756,14 +766,14 @@ export class DispatchService extends Service {
 			'form.addEventListener("submit",function(ev){',
 			'if(!bag.length)return;',
 			'ev.preventDefault();',
-			'var btn=form.querySelector("button[type=submit]");',
+			'var btn=ev.submitter||form.querySelector("button[type=submit]");var submitMode=(btn&&btn.name==="mode"&&btn.value)||"queue";',
 			'if(btn){btn.disabled=true;btn.textContent="正在发送图片…"}',
 			'form.classList.add("busy");',
 			'Promise.all(bag.slice(0,20).map(function(f){return pack(f).catch(function(){return null})})).then(function(imgs){',
 			'imgs=imgs.filter(Boolean);',
 			'if(!imgs.length){alert("图片读不出来，换一张 jpg/png 再试");if(btn){btn.disabled=false;btn.textContent="发送"};form.classList.remove("busy");return}',
 			'try{sessionStorage.removeItem("dsh-draft-"+location.pathname)}catch(e){}',
-			'var body={text:(form.querySelector("textarea[name=text]")||{}).value||"",images:imgs};',
+			'var body={text:(form.querySelector("textarea[name=text]")||{}).value||"",images:imgs,mode:submitMode};',
 			'var ap=form.querySelector("[name=agentPreset]");if(ap&&ap.value)body.agentPreset=ap.value;',
 			'var md=form.querySelector("[name=model]");if(md&&md.value)body.model=md.value;',
 			'var pm=form.querySelector("[name=permission]");if(pm&&pm.value)body.permission=pm.value;',
@@ -806,7 +816,16 @@ export class DispatchService extends Service {
 			'.banner{background:#3d2b1f;border:1px solid #e09f3e;border-radius:12px;padding:12px;margin:12px 0}',
 			'.banner form{display:flex;gap:8px;padding:0;margin:8px 0 0}',
 			'.banner button{margin:0}',
-			'.deny{background:#6c757d}',
+			'.question-banner{background:#132a3a;border:1px solid #3a86ff;border-radius:12px;padding:12px;margin:12px 0}',
+			'.question-form{padding:0;margin-top:10px}',
+			'.question-field{border:1px solid #3a506b;border-radius:10px;margin:10px 0;padding:10px}',
+			'.question-field legend{color:#8be9fd;padding:0 6px}',
+			'.question-text{font-weight:600;margin-bottom:8px;white-space:pre-wrap}',
+			'.question-option{display:flex;align-items:flex-start;gap:9px;background:#111a33;border:1px solid #263b5e;border-radius:9px;padding:10px;margin:8px 0}',
+			'.question-option input{width:20px;height:20px;flex:none;margin:1px 0 0}',
+			'.question-option small{display:block;opacity:.65;margin-top:3px}',
+			'.question-custom{display:block;margin-top:10px}.question-custom span{display:block;font-size:13px;opacity:.7;margin-bottom:5px}',
+			'.deny{background:#6c757d}.composer-actions{display:flex;gap:8px;flex-wrap:wrap}.composer-actions .steer{background:#e09f3e;color:#111}',
 			'#voice-bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:8px 0 12px;padding:10px 12px;background:#111a33;border:1px solid #3a506b;border-radius:12px}',
 			'#voice-bar button{margin:0}',
 			'#voice-bar.live{border-color:#3a86ff}',
@@ -853,7 +872,7 @@ export class DispatchService extends Service {
 		try {
 			const route = urlObj.pathname
 			if (route === '/dispatch/health' && req.method === 'GET') {
-				return this.sendJson(res, 200, { ok: true, pending: this.pending.size })
+				return this.sendJson(res, 200, { ok: true, pending: this.pending.size, pendingQuestions: this.pendingQuestions.size })
 			}
 			if (!this.checkToken(this.tokenFrom(req, urlObj))) {
 				if (route.startsWith('/dispatch/chat') || route === '/dispatch/decision') {
@@ -865,6 +884,7 @@ export class DispatchService extends Service {
 				return this.sendJson(res, 200, {
 					ok: true,
 					pending: [...this.pending.entries()].map(([rpcId, e]) => ({ rpcId, ...e })),
+					pendingQuestions: [...this.pendingQuestions.entries()].map(([rpcId, e]) => ({ rpcId, sessionId: e.sessionId, questions: e.questions, at: e.at })),
 					recent: this.events.slice(-20)
 				})
 			}
@@ -924,6 +944,7 @@ export class DispatchService extends Service {
 				return this.sendJson(res, 200, { ok: true, sessions })
 			}
 			if (route === '/dispatch/decision') return await this.handleDecision(urlObj, res)
+			if (route === '/dispatch/question' && req.method === 'POST') return await this.handleQuestion(req, urlObj, res)
 			if (route === '/dispatch/task' && req.method === 'POST') return await this.handleTask(req, res)
 			if (route === '/dispatch/chat' && req.method === 'GET') return await this.handleChatList(urlObj, res)
 			if (route === '/dispatch/chat' && req.method === 'POST') return await this.handleChatNew(req, urlObj, res)
@@ -942,6 +963,77 @@ export class DispatchService extends Service {
 			this.log('handler error:', err?.stack ?? err)
 			if (!res.headersSent) this.sendJson(res, 500, { ok: false, error: String(err?.message ?? err) })
 		}
+	}
+
+	renderQuestionBanner(rpcId, entry, returnSessionId) {
+		const fields = entry.questions.map((q, qi) => {
+			const multi = q.multiSelect === true
+			const type = multi ? 'checkbox' : 'radio'
+			const options = (q.options ?? []).map((option, oi) => [
+				'<label class="question-option">',
+				'<input type="' + type + '" name="' + (multi ? `q${qi}o${oi}` : `q${qi}pick`) + '" value="' + (multi ? '1' : oi) + '">',
+				'<span><strong>' + this.escHtml(option.label) + '</strong>',
+				option.description ? '<small>' + this.escHtml(option.description) + '</small>' : '',
+				'</span></label>'
+			].join('')).join('')
+			return [
+				'<fieldset class="question-field"><legend>' + this.escHtml(q.header || `问题 ${qi + 1}`) + '</legend>',
+				'<div class="question-text">' + this.escHtml(q.question) + '</div>',
+				q.detail ? '<div class="muted">' + this.escHtml(q.detail) + '</div>' : '',
+				options,
+				'<label class="question-custom"><span>自定义回答</span><input type="text" name="q' + qi + 'custom" placeholder="也可以输入其他答案"></label>',
+				'</fieldset>'
+			].join('')
+		}).join('')
+		return [
+			'<div class="question-banner"><strong>需要你回答</strong>',
+			'<form class="question-form" method="post" action="/dispatch/question?token=' + encodeURIComponent(this.config.token) + '">',
+			'<input type="hidden" name="rpcId" value="' + this.escHtml(rpcId) + '">',
+			'<input type="hidden" name="returnSessionId" value="' + this.escHtml(returnSessionId) + '">',
+			fields,
+			'<button type="submit">提交回答</button></form></div>'
+		].join('')
+	}
+
+	async handleQuestion(req, urlObj, res) {
+		const fields = await this.readForm(req, urlObj)
+		const rpcId = String(fields.rpcId || '')
+		const returnSessionId = String(fields.returnSessionId || '')
+		const entry = this.pendingQuestions.get(rpcId)
+		if (!entry) {
+			return this.sendResultPage(res, '⏳', '这个问题已经回答', '可能电脑端已经先行提交，无需重复操作。',
+				returnSessionId ? `<p style="margin-top:20px"><a href="${this.escHtml(this.chatPath(returnSessionId))}" style="color:#8be9fd">返回会话</a></p>` : '')
+		}
+		const answers = entry.questions.map((q, qi) => {
+			const selected = []
+			if (q.multiSelect === true) {
+				for (let oi = 0; oi < (q.options ?? []).length; oi += 1) {
+					if (String(fields[`q${qi}o${oi}`] || '') === '1') selected.push(q.options[oi].label)
+				}
+			} else {
+				const picked = Number(fields[`q${qi}pick`])
+				if (Number.isInteger(picked) && picked >= 0 && picked < (q.options ?? []).length) selected.push(q.options[picked].label)
+			}
+			const custom = String(fields[`q${qi}custom`] || '').trim()
+			if (q.multiSelect !== true && custom) selected.splice(0)
+			return { id: q.id, selected, ...(custom ? { custom } : {}) }
+		})
+		if (answers.some((answer) => answer.selected.length === 0 && !answer.custom)) {
+			return this.sendResultPage(res, '⚠️', '还有问题没有回答', '请为每一道题选择一个选项，或填写自定义回答。',
+				returnSessionId ? `<p style="margin-top:20px"><a href="${this.escHtml(this.chatPath(returnSessionId))}" style="color:#8be9fd">返回继续填写</a></p>` : '')
+		}
+		const receipt = await this.client.respond({
+			type: 'client-response', rpcId,
+			result: { ok: true, value: { sessionId: entry.sessionId, answer: { answers } } }
+		})
+		if (!receipt.accepted) {
+			if (receipt.reason === 'not-pending') this.pendingQuestions.delete(rpcId)
+			return this.sendResultPage(res, '⏳', '回答没有提交', receipt.reason === 'not-pending' ? '电脑端已经先行回答。' : `Harness 拒绝了回答：${receipt.reason || 'unknown'}`,
+				returnSessionId ? `<p style="margin-top:20px"><a href="${this.escHtml(this.chatPath(returnSessionId))}" style="color:#8be9fd">返回会话</a></p>` : '')
+		}
+		this.pendingQuestions.delete(rpcId)
+		this.note('question-answered', { rpcId, sessionId: entry.sessionId, answers })
+		return this.redirect(res, this.chatPath(returnSessionId || entry.sessionId))
 	}
 
 	async applyDecision(rpcId, outcome, sessionId, approvalId) {
@@ -1016,13 +1108,19 @@ export class DispatchService extends Service {
 			const root = rootOf(e.sessionId)
 			pendingBySid.set(root, (pendingBySid.get(root) ?? 0) + 1)
 		}
+		const questionsBySid = new Map()
+		for (const [, e] of this.pendingQuestions) {
+			const root = rootOf(e.sessionId)
+			questionsBySid.set(root, (questionsBySid.get(root) ?? 0) + 1)
+		}
 		const rows = items.map((s) => {
 			const href = this.chatPath(s.sessionId)
 			const title = this.escHtml(this.sessionTitleOf(s))
 			const run = s.running ? ' 运行中' : ''
 			const need = pendingBySid.get(s.sessionId) ? ' · 待审批' : ''
+			const ask = questionsBySid.get(s.sessionId) ? ' · 待回答' : ''
 			const cwd = s.cwd ? this.escHtml(s.cwd) : ''
-			return `<div class="row"><a href="${this.escHtml(href)}">${title}</a><div class="muted">${this.escHtml(s.sessionId.slice(-12))}${run}${need}${cwd ? ' · ' + cwd : ''}</div></div>`
+			return `<div class="row"><a href="${this.escHtml(href)}">${title}</a><div class="muted">${this.escHtml(s.sessionId.slice(-12))}${run}${need}${ask}${cwd ? ' · ' + cwd : ''}</div></div>`
 		}).join('')
 		const nav = showArchived
 			? `<p><a href="${this.escHtml(this.chatPath())}">← 进行中</a> · 已归档 ${archivedRows.length}</p>`
@@ -1140,14 +1238,26 @@ export class DispatchService extends Service {
 			const sep = switchModel.indexOf('|')
 			const provider = sep >= 0 ? switchModel.slice(0, sep) : ''
 			const model = sep >= 0 ? switchModel.slice(sep + 1) : ''
-			if (provider && model) {
-				const selected = await this.client.sessions.selectModel({ sessionId, provider, model })
-				if (!selected.result.ok) {
-					return this.sendHtml(res, this.pageShell('换模型失败', `<main><p>${this.escHtml(JSON.stringify(selected.result.error))}</p><p><a href="${this.escHtml(this.chatPath(sessionId))}">返回会话</a></p></main>`), 502)
-				}
-				this.note('model', { sessionId, provider, model })
+			if (!provider || !model) {
+				return this.sendHtml(res, this.pageShell('换模型失败', `<main><p>模型参数无效。</p><p><a href="${this.escHtml(this.chatPath(sessionId))}">返回会话</a></p></main>`), 400)
 			}
-			return this.redirect(res, this.chatPath(sessionId))
+			const selected = await this.client.sessions.selectModel({ sessionId, provider, model })
+			if (!selected.result.ok) {
+				return this.sendHtml(res, this.pageShell('换模型失败', `<main><p>${this.escHtml(JSON.stringify(selected.result.error))}</p><p><a href="${this.escHtml(this.chatPath(sessionId))}">返回会话</a></p></main>`), 502)
+			}
+			const applied = selected.result.value.selected
+			let verified = false
+			try {
+				const reread = await this.client.sessions.models({ sessionId })
+				verified = Boolean(reread.result.ok && reread.result.value.current?.provider === applied.provider && reread.result.value.current?.model === applied.model)
+			} catch { /* report unverified below */ }
+			this.note('model', { sessionId, requested: { provider, model }, applied, verified })
+			const qs = new URLSearchParams({
+				modelChanged: verified ? '1' : '0',
+				modelProvider: applied.provider,
+				modelName: applied.model
+			})
+			return this.redirect(res, this.chatPath(sessionId) + '&' + qs.toString())
 		}
 		const switchPerm = urlObj.searchParams.get('switchPermission')
 		if (switchPerm) {
@@ -1206,14 +1316,27 @@ export class DispatchService extends Service {
 				'</p></div>'
 			].join('')
 		}).join('')
+		const questionsHere = [...this.pendingQuestions.entries()].filter(([, e]) => sessionTree.has(e.sessionId))
+		const questionBanners = questionsHere.map(([rpcId, e]) => this.renderQuestionBanner(rpcId, e, sessionId)).join('')
 		const running = await this.sessionRunning(sessionId)
 		const last = folded[folded.length - 1]
 		const awaitingReply = !last || last.role === 'user'
 		const sent = Boolean(urlObj.searchParams.get('sent'))
-		const waiting = pendingHere.length > 0 || running || (sent && awaitingReply)
-		const extra = waiting
-			? '<p class="muted">进行中……有回复或审批变化后会自动刷新。正在打字或已选未发的图时会暂停刷新。</p>'
+		const waiting = pendingHere.length > 0 || questionsHere.length > 0 || running || (sent && awaitingReply)
+		const steerNotice = urlObj.searchParams.get('steered') === '1'
+			? '<div class="banner"><strong>⚡ 已插队</strong><div class="muted">消息已注入当前运行轮次。</div></div>'
+			: urlObj.searchParams.get('steerFallback') === '1'
+				? '<div class="banner"><strong>已转为普通续聊</strong><div class="muted">提交时当前轮次已不接受插队，消息没有丢失，已进入下一轮。</div></div>'
+				: ''
+		const changedModel = urlObj.searchParams.get('modelName')
+		const modelNotice = changedModel
+			? (urlObj.searchParams.get('modelChanged') === '1'
+				? '<div class="banner"><strong>✅ 模型已切换</strong><div class="muted">当前选择：' + this.escHtml(urlObj.searchParams.get('modelProvider') || '') + ' / ' + this.escHtml(changedModel) + '。正在执行的模型调用不会倒带，后续模型调用使用新选择。</div></div>'
+				: '<div class="banner"><strong>⚠️ 模型切换未能复读确认</strong><div class="muted">接口返回：' + this.escHtml(urlObj.searchParams.get('modelProvider') || '') + ' / ' + this.escHtml(changedModel) + '，但重新读取 current 未匹配，请刷新后检查当前模型。</div></div>')
 			: ''
+		const extra = modelNotice + steerNotice + (waiting
+			? '<p class="muted">进行中……有回复、问题或审批变化后会自动刷新。正在打字或已选未发的图时会暂停刷新。</p>'
+			: '')
 		const draftJs = [
 			'<script>(function(){',
 			'var k="dsh-draft-"+location.pathname;',
@@ -1263,12 +1386,16 @@ export class DispatchService extends Service {
 					}
 				}
 				if (opts.length) {
+					const routeWarning = catalog.result.value.routable === false ? '<div class="muted">⚠️ 当前 provider 暂无可用路由</div>' : ''
+					const failures = (catalog.result.value.failures ?? []).map((f) => `${f.name || f.id}: ${f.message}`).join('；')
 					modelForm = [
 						'<form method="get" action="' + this.escHtml('/dispatch/chat/' + encodeURIComponent(sessionId)) + '">',
 						'<input type="hidden" name="token" value="' + this.escHtml(this.config.token) + '">',
-						'<label class="muted">模型</label>',
+						'<label class="muted">模型 · 当前 ' + this.escHtml(modelLabel || '未知') + '</label>',
+						routeWarning,
+						failures ? '<div class="muted">部分目录加载失败：' + this.escHtml(failures) + '</div>' : '',
 						'<select name="switchModel">' + opts.join('') + '</select>',
-						'<button type="submit">切换</button></form>'
+						'<button type="submit">切换并验证</button></form>'
 					].join('')
 				}
 			}
@@ -1298,14 +1425,15 @@ export class DispatchService extends Service {
 		const lastAssistant = last?.role === 'assistant' ? String(last.text || '').slice(0, 2500) : ''
 		const body = [
 			'<header class="chat-header"><a href="' + this.escHtml(this.chatPath()) + '">← 会话列表</a><strong style="margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + this.escHtml(currentTitle) + '</strong></header>',
-			'<main>', extra, banners,
+			'<main>', extra, banners, questionBanners,
 			this.voicePanel({ sessionId, title: currentTitle, token: this.config.token, mode: 'session' }),
 			msgs,
 			'<form id="composer" class="js-chat" method="post" action="' + this.escHtml(this.chatPath(sessionId)) + '" enctype="multipart/form-data">',
 			'<textarea name="text" rows="3" placeholder="继续说…"></textarea>',
 			'<input type="file" name="images" accept="image/jpeg,image/png,image/webp,image/gif" multiple>',
 			'<div class="thumbs"></div><p class="muted img-hint">点选图，再选会追加，最多 20 张</p>',
-			'<div class="composer-actions"><button type="submit">发送续聊</button></div></form>',
+			'<div class="composer-actions"><button type="submit" name="mode" value="queue">发送续聊</button><button type="submit" name="mode" value="steer" class="steer">⚡ 插队发送</button></div>',
+			'<p class="muted">插队会尽快注入当前运行轮次；当前轮次已结束时自动转为普通续聊。</p></form>',
 			'<details class="adv"><summary>高级 · 模型 / 权限 / 改名</summary>',
 			modelForm, permForm, renameForm,
 			'<p class="muted">' + archiveLink + '</p>',
@@ -1331,18 +1459,26 @@ export class DispatchService extends Service {
 		}
 		const text = (fields.text ?? '').trim()
 		if (!text && !images.length) return this.redirect(res, this.chatPath(sessionId))
-		const prompted = await this.client.sessions.prompt({
-			sessionId,
-			mode: 'queue',
-			content: this.promptContent(text, images)
-		})
+		const requestedMode = String(fields.mode || '') === 'steer' ? 'steer' : 'queue'
+		const content = this.promptContent(text, images)
+		let actualMode = requestedMode
+		let prompted = await this.client.sessions.prompt({ sessionId, mode: actualMode, content })
+		if (!prompted.result.ok && requestedMode === 'steer') {
+			const code = String(prompted.result.error?.code || '')
+			const reason = String(prompted.result.error?.details?.reason || '')
+			if (code === 'agent-busy' || code === 'steer-unavailable' || /steer|running|current turn/i.test(reason)) {
+				actualMode = 'queue'
+				prompted = await this.client.sessions.prompt({ sessionId, mode: actualMode, content })
+			}
+		}
 		if (!prompted.result.ok) {
 			return this.sendHtml(res, this.pageShell('发送失败', `<main><p>${this.escHtml(JSON.stringify(prompted.result.error))}</p></main>`), 502)
 		}
-		this.note('task', { sessionId, mode: 'queue', text: (text || '（图片）').slice(0, 120) })
+		this.note('task', { sessionId, mode: actualMode, requestedMode, text: (text || '（图片）').slice(0, 120) })
 		this.trackedTasks.set(sessionId, { snippet: (text || '（图片）').slice(0, 80).replace(/\s+/g, ' '), at: Date.now() })
-		this.log(`chat reply → ${sessionId}`)
-		this.redirect(res, this.chatPath(sessionId) + '&sent=1')
+		this.log(`chat reply → ${sessionId} mode=${actualMode} requested=${requestedMode}`)
+		const flag = requestedMode === 'steer' ? (actualMode === 'steer' ? '&steered=1' : '&steerFallback=1') : '&sent=1'
+		this.redirect(res, this.chatPath(sessionId) + flag)
 	}
 
 	async handleChatImage(sessionId, attachmentId, res) {
