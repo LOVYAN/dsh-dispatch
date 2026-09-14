@@ -21,16 +21,20 @@ import { Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { InProcessApiClient, toFetchHandler } from '@deepseek-ai/dsh-host-apiproxy'
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { closeSync, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, extname, join, resolve, sep } from 'node:path'
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 
 const OUTCOMES = new Set(['allowed-once', 'rejected'])
 const MAX_BODY = 12 * 1024 * 1024
 const IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif'])
+const VIDEO_TYPES = new Map([['video/mp4', '.mp4'], ['video/webm', '.webm'], ['video/quicktime', '.mov']])
 const MAX_IMAGES = 20
+const MAX_VIDEO_BYTES = 200 * 1024 * 1024
+const VIDEO_CHUNK_BYTES = 4 * 1024 * 1024
+const VIDEO_UPLOAD_TTL_MS = 24 * 60 * 60 * 1000
 
 export class DispatchService extends Service {
 	static inject = ['webServer', 'apiProxy']
@@ -71,6 +75,12 @@ export class DispatchService extends Service {
 		this.trackedTasks = new Map()
 		/** sessionId → latest completed turn summary, persisted for voice reads. */
 		this.turnResults = this.loadTurnResults()
+		/** Page-scoped history research cards; stored outside Agent conversation context. */
+		this.historyCards = this.loadHistoryCards()
+		/** Literal message cache used only for first-pass keyword lookup. */
+		this.historySearchIndex = this.loadHistorySearchIndex()
+		/** Model-generated structured session digests used for semantic tag lookup. */
+		this.sessionDigests = this.loadSessionDigests()
 		this.sessionRunningState = new Map()
 		this.client = new InProcessApiClient(toFetchHandler(this.ctx.apiProxy), 120000)
 		this.start()
@@ -81,6 +91,11 @@ export class DispatchService extends Service {
 	secretsPath() {
 		const home = process.env.DSH_HOME || join(homedir(), '.dsh-home')
 		return join(home, 'dsh-dispatch.json')
+	}
+
+	videoUploadDir() {
+		const home = process.env.DSH_HOME || join(homedir(), '.dsh-home')
+		return join(dirname(home), '工作区', 'uploads', 'videos')
 	}
 
 	turnResultsPath() {
@@ -102,6 +117,83 @@ export class DispatchService extends Service {
 			writeFileSync(this.turnResultsPath(), JSON.stringify({ version: 1, updatedAt: Date.now(), sessions }, null, 2) + '\n', 'utf8')
 		} catch (err) {
 			this.log('could not persist turn results:', err?.message ?? err)
+		}
+	}
+
+	historyCardsPath() {
+		const home = process.env.DSH_HOME || join(homedir(), '.dsh-home')
+		return join(home, 'dsh-history-search-results.json')
+	}
+
+	loadHistoryCards() {
+		try {
+			const parsed = JSON.parse(readFileSync(this.historyCardsPath(), 'utf8') || '{}')
+			return new Map(Object.entries(parsed.scopes || {}).map(([key, rows]) => [key, Array.isArray(rows) ? rows : []]))
+		} catch { return new Map() }
+	}
+
+	persistHistoryCards() {
+		try {
+			mkdirSync(dirname(this.historyCardsPath()), { recursive: true })
+			writeFileSync(this.historyCardsPath(), JSON.stringify({ version: 1, updatedAt: Date.now(), scopes: Object.fromEntries(this.historyCards) }, null, 2) + '\n', 'utf8')
+		} catch (err) {
+			this.log('could not persist history cards:', err?.message ?? err)
+		}
+	}
+
+	historySearchIndexPath() {
+		const home = process.env.DSH_HOME || join(homedir(), '.dsh-home')
+		return join(home, 'dsh-history-search-index.json')
+	}
+
+	loadHistorySearchIndex() {
+		try {
+			const parsed = JSON.parse(readFileSync(this.historySearchIndexPath(), 'utf8') || '{}')
+			return new Map(Object.entries(parsed.sessions || {}))
+		} catch { return new Map() }
+	}
+
+	persistHistorySearchIndex() {
+		try {
+			mkdirSync(dirname(this.historySearchIndexPath()), { recursive: true })
+			writeFileSync(this.historySearchIndexPath(), JSON.stringify({ version: 1, updatedAt: Date.now(), sessions: Object.fromEntries(this.historySearchIndex) }) + '\n', 'utf8')
+		} catch (err) {
+			this.log('could not persist history search index:', err?.message ?? err)
+		}
+	}
+
+	sessionDigestsPath() {
+		const home = process.env.DSH_HOME || join(homedir(), '.dsh-home')
+		return join(home, 'dsh-session-digests.json')
+	}
+
+	loadSessionDigests() {
+		try {
+			const parsed = JSON.parse(readFileSync(this.sessionDigestsPath(), 'utf8') || '{}')
+			return new Map(Object.entries(parsed.sessions || {}))
+		} catch { return new Map() }
+	}
+
+	persistSessionDigests() {
+		try {
+			mkdirSync(dirname(this.sessionDigestsPath()), { recursive: true })
+			writeFileSync(this.sessionDigestsPath(), JSON.stringify({ version: 1, updatedAt: Date.now(), sessions: Object.fromEntries(this.sessionDigests) }, null, 2) + '\n', 'utf8')
+		} catch (err) {
+			this.log('could not persist session digests:', err?.message ?? err)
+		}
+	}
+
+	normalizeDigest(sessionId, value, metadata = {}) {
+		const list = (name, max) => [...new Set((Array.isArray(value?.[name]) ? value[name] : []).map((x) => String(x || '').trim()).filter(Boolean))].slice(0, max)
+		return {
+			sessionId,
+			title: String(value?.title || metadata.title || sessionId.slice(-12)).slice(0, 200),
+			summary: String(value?.summary || '').trim().slice(0, 5000),
+			topics: list('topics', 5), subjects: list('subjects', 8), problems: list('problems', 8),
+			carriers: list('carriers', 6), outcomes: list('outcomes', 6), keywords: list('keywords', 15),
+			createdAt: Number(metadata.createdAt || value?.createdAt || 0), updatedAt: Number(metadata.updatedAt || value?.updatedAt || 0),
+			lastRelevantAt: Number(value?.lastRelevantAt || metadata.updatedAt || 0), sourceSeq: Number(metadata.sourceSeq || value?.sourceSeq || 0),
+			compactionId: String(metadata.compactionId || value?.compactionId || ''), indexedAt: Date.now()
 		}
 	}
 
@@ -179,6 +271,12 @@ export class DispatchService extends Service {
 			void this.hostLoop(controller)
 			return () => controller.abort()
 		}, 'dsh-dispatch: host bridge')
+		this.ctx.effect(() => {
+			const timer = setInterval(() => {
+				try { const removed = this.cleanVideoUploads(); if (removed) this.log(`cleaned ${removed} expired video upload files`) } catch (err) { this.log('video upload cleanup failed:', err) }
+			}, 60 * 60 * 1000)
+			return () => clearInterval(timer)
+		}, 'dsh-dispatch: video upload cleanup')
 		this.log(`active (push=${this.config.pushEnabled ? 'on' : 'off'}, topic=${this.config.ntfyTopic}, publicBase=${this.config.publicBaseUrl || '(none)'}, secrets=${this.secretsPath()})`)
 	}
 
@@ -444,6 +542,149 @@ export class DispatchService extends Service {
 		return buf.toString('base64')
 	}
 
+	videoUploadMetaPath(id) { return join(this.videoUploadDir(), String(id) + '.json') }
+	videoUploadPartPath(id) { return join(this.videoUploadDir(), String(id) + '.part') }
+
+	cleanVideoUploads() {
+		const dir = this.videoUploadDir()
+		if (!existsSync(dir)) return 0
+		let removed = 0
+		const cutoff = Date.now() - VIDEO_UPLOAD_TTL_MS
+		for (const name of readdirSync(dir)) {
+			if (!name.endsWith('.json') && !name.endsWith('.part') && !name.endsWith('.upload')) continue
+			const path = join(dir, name)
+			try { if (statSync(path).mtimeMs < cutoff) { unlinkSync(path); removed += 1 } } catch { /* ignore */ }
+		}
+		return removed
+	}
+
+	videoUploadFingerprint(value) {
+		return createHash('sha256').update(String(value || '')).digest('hex').slice(0, 32)
+	}
+
+	readVideoUploadMeta(id) {
+		if (!/^[a-f0-9]{32}$/.test(String(id || ''))) return null
+		try { return JSON.parse(readFileSync(this.videoUploadMetaPath(id), 'utf8')) } catch { return null }
+	}
+
+	writeVideoUploadMeta(meta) {
+		writeFileSync(this.videoUploadMetaPath(meta.id), JSON.stringify(meta, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 })
+	}
+
+	initVideoUpload(fields) {
+		this.cleanVideoUploads()
+		const mediaType = String(fields.mediaType || '').toLowerCase().split(';')[0].trim()
+		const ext = VIDEO_TYPES.get(mediaType)
+		const totalBytes = Number(fields.totalBytes || 0)
+		if (!ext) throw Object.assign(new Error('unsupported video type'), { statusCode: 415 })
+		if (!Number.isSafeInteger(totalBytes) || totalBytes <= 0 || totalBytes > MAX_VIDEO_BYTES) throw Object.assign(new Error('invalid video size'), { statusCode: 413 })
+		const originalName = String(fields.originalName || ('video' + ext)).replace(/[\r\n\\/]/g, '_').slice(0, 240)
+		const lastModified = Number(fields.lastModified || 0)
+		const fingerprint = String(fields.fingerprint || `${originalName}|${totalBytes}|${lastModified}|${mediaType}`)
+		const id = this.videoUploadFingerprint(fingerprint)
+		const dir = this.videoUploadDir()
+		mkdirSync(dir, { recursive: true })
+		let meta = this.readVideoUploadMeta(id)
+		if (!meta || meta.totalBytes !== totalBytes || meta.mediaType !== mediaType || meta.completed) {
+			meta = { id, originalName, mediaType, ext, totalBytes, lastModified, receivedBytes: 0, sessionId: String(fields.sessionId || '').slice(0, 160), createdAt: Date.now(), updatedAt: Date.now(), completed: false }
+			try { unlinkSync(this.videoUploadPartPath(id)) } catch { /* ignore */ }
+			this.writeVideoUploadMeta(meta)
+		} else {
+			try { meta.receivedBytes = Math.min(totalBytes, statSync(this.videoUploadPartPath(id)).size) } catch { meta.receivedBytes = 0 }
+			meta.updatedAt = Date.now()
+			this.writeVideoUploadMeta(meta)
+		}
+		return { uploadId: id, receivedBytes: meta.receivedBytes, totalBytes, chunkBytes: VIDEO_CHUNK_BYTES }
+	}
+
+	videoSignatureOk(path, mediaType) {
+		let fd
+		try {
+			fd = openSync(path, 'r')
+			const head = Buffer.alloc(16)
+			const n = readSync(fd, head, 0, head.length, 0)
+			if (mediaType === 'video/webm') return n >= 4 && head.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]))
+			if (mediaType === 'video/mp4' || mediaType === 'video/quicktime') return n >= 12 && head.subarray(4, 8).toString('ascii') === 'ftyp'
+			return false
+		} catch { return false } finally { if (fd !== undefined) closeSync(fd) }
+	}
+
+	receiveVideoChunk(req, uploadId) {
+		return new Promise((resolve, reject) => {
+			const meta = this.readVideoUploadMeta(uploadId)
+			if (!meta || meta.completed) return reject(Object.assign(new Error('upload not found'), { statusCode: 404 }))
+			const offset = Number(req.headers['x-dsh-upload-offset'] || -1)
+			const declaredLength = Number(req.headers['content-length'] || 0)
+			if (!Number.isSafeInteger(offset) || offset !== meta.receivedBytes) return reject(Object.assign(new Error(`offset mismatch; expected ${meta.receivedBytes}`), { statusCode: 409, expectedOffset: meta.receivedBytes }))
+			if (!declaredLength || declaredLength > VIDEO_CHUNK_BYTES || offset + declaredLength > meta.totalBytes) return reject(Object.assign(new Error('invalid chunk size'), { statusCode: 413 }))
+			const path = this.videoUploadPartPath(uploadId)
+			const stream = createWriteStream(path, { flags: offset === 0 ? 'w' : 'r+', start: offset, mode: 0o600 })
+			let bytes = 0
+			let settled = false
+			const fail = (err) => {
+				if (settled) return
+				settled = true
+				try { stream.destroy() } catch { /* ignore */ }
+				try { if (existsSync(path)) truncateSync(path, offset) } catch { /* ignore */ }
+				this.log(`video chunk failed id=${uploadId} offset=${offset} received=${bytes}: ${String(err?.message || err)}`)
+				reject(err)
+			}
+			req.on('data', (chunk) => { bytes += chunk.length; if (bytes > declaredLength) fail(Object.assign(new Error('chunk larger than declared'), { statusCode: 400 })) })
+			req.on('aborted', () => fail(Object.assign(new Error('chunk upload aborted'), { statusCode: 499 })))
+			req.on('error', fail)
+			stream.on('error', fail)
+			stream.on('finish', () => {
+				if (settled) return
+				if (bytes !== declaredLength) return fail(Object.assign(new Error('incomplete chunk'), { statusCode: 400 }))
+				meta.receivedBytes = offset + bytes
+				meta.updatedAt = Date.now()
+				try {
+					this.writeVideoUploadMeta(meta)
+					settled = true
+					resolve({ uploadId, receivedBytes: meta.receivedBytes, totalBytes: meta.totalBytes, complete: meta.receivedBytes === meta.totalBytes })
+				} catch (err) { fail(err) }
+			})
+			req.pipe(stream)
+		})
+	}
+
+	completeVideoUpload(uploadId) {
+		const meta = this.readVideoUploadMeta(uploadId)
+		if (!meta || meta.completed) throw Object.assign(new Error('upload not found'), { statusCode: 404 })
+		const partPath = this.videoUploadPartPath(uploadId)
+		let bytes = 0
+		try { bytes = statSync(partPath).size } catch { /* missing */ }
+		if (bytes !== meta.totalBytes || meta.receivedBytes !== meta.totalBytes) throw Object.assign(new Error(`upload incomplete; received ${bytes} of ${meta.totalBytes}`), { statusCode: 409, expectedOffset: bytes })
+		if (!this.videoSignatureOk(partPath, meta.mediaType)) throw Object.assign(new Error('video bytes do not match declared type'), { statusCode: 415 })
+		const id = new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 14) + '-' + randomBytes(6).toString('hex')
+		const finalPath = join(this.videoUploadDir(), id + meta.ext)
+		renameSync(partPath, finalPath)
+		meta.completed = true
+		meta.finalPath = finalPath
+		meta.updatedAt = Date.now()
+		try { unlinkSync(this.videoUploadMetaPath(uploadId)) } catch { /* ignore */ }
+		return { id, sessionId: meta.sessionId, originalName: meta.originalName, storedPath: finalPath, mediaType: meta.mediaType, bytes, uploadedAt: Date.now() }
+	}
+
+	formVideos(fields) {
+		const rows = Array.isArray(fields.videos) ? fields.videos : []
+		const root = resolve(this.videoUploadDir())
+		const out = []
+		for (const value of rows.slice(0, 1)) {
+			const storedPath = resolve(String(value?.storedPath || ''))
+			const mediaType = String(value?.mediaType || '').toLowerCase()
+			if (!storedPath.startsWith(root + sep) || !VIDEO_TYPES.has(mediaType) || !existsSync(storedPath)) continue
+			try {
+				const stat = statSync(storedPath)
+				const bytes = stat.size
+				if (!stat.isFile() || !bytes || bytes > MAX_VIDEO_BYTES || !this.videoSignatureOk(storedPath, mediaType)) continue
+				const originalName = String(value?.originalName || ('video' + extname(storedPath))).replace(/[\r\n\\/]/g, '_').slice(0, 240)
+				out.push({ storedPath, mediaType, bytes, originalName })
+			} catch { /* invalid upload reference */ }
+		}
+		return out
+	}
+
 	formImages(fields) {
 		const out = []
 		if (Array.isArray(fields.images)) {
@@ -499,9 +740,25 @@ export class DispatchService extends Service {
 		return out
 	}
 
-	promptContent(text, images) {
+	videoPromptText(video) {
+		if (!video || typeof video !== 'object' || !video.storedPath) return ''
+		const bytes = Number(video.bytes || 0)
+		const size = bytes ? `${(bytes / 1024 / 1024).toFixed(2)} MB` : '未知大小'
+		return [
+			'【本地视频附件】',
+			`原文件名：${String(video.originalName || 'video').slice(0, 240)}`,
+			`媒体类型：${String(video.mediaType || 'video/mp4')}`,
+			`文件大小：${size}`,
+			`本机路径：${String(video.storedPath)}`,
+			'请把这个路径视为用户本轮上传的视频。优先使用当前可用的视频理解能力或相关工具直接处理；若当前模型通道不能原生读取视频，则使用本机工具检查视频、抽取关键帧和音频后再分析。不要声称视频已直接进入 session.prompt 的原生附件协议。'
+		].join('\n')
+	}
+
+	promptContent(text, images, video) {
 		const content = []
-		if (text) content.push({ type: 'text', text })
+		const videoText = this.videoPromptText(video)
+		const combinedText = [text, videoText].filter(Boolean).join('\n\n')
+		if (combinedText) content.push({ type: 'text', text: combinedText })
 		else if (images.length) content.push({ type: 'text', text: '（图片）' })
 		for (const img of images) content.push(img)
 		return content
@@ -790,6 +1047,22 @@ export class DispatchService extends Service {
 		].join('')
 	}
 
+	sendAttachmentJs() {
+		return [
+			'<script>(function(){',
+			'function load(f){return new Promise(function(ok,bad){var r=new FileReader();r.onload=function(){var im=new Image();im.onload=function(){ok(im)};im.onerror=bad;im.src=r.result};r.onerror=bad;r.readAsDataURL(f)})}',
+			'function pack(f){return load(f).then(function(im){var m=1280,w=im.width,h=im.height;if(w>m||h>m){var s=Math.min(m/w,m/h);w=Math.round(w*s);h=Math.round(h*s)}var c=document.createElement("canvas");c.width=w;c.height=h;c.getContext("2d").drawImage(im,0,0,w,h);return{name:((f.name||"image").replace(/\\.[^.]+$/ ,"")||"image")+".jpg",mediaType:"image/jpeg",data:c.toDataURL("image/jpeg",.72).replace(/^data:[^;]+;base64,/,"")}})}',
+			'function key(f){return(f.name||"")+"|"+f.size+"|"+(f.lastModified||0)}function human(n){return n>=1048576?(n/1048576).toFixed(1)+" MB":Math.max(1,Math.round(n/1024))+" KB"}',
+			'function sleep(ms){return new Promise(function(r){setTimeout(r,ms)})}function requestJson(url,opt){return fetch(url,opt).then(function(r){return r.text().then(function(t){var b={};try{b=JSON.parse(t||"{}")}catch(e){}if(!r.ok||!b.ok){var x=new Error(b.error||("HTTP "+r.status));x.expectedOffset=b.expectedOffset;throw x}return b})})}',
+			'function upload(f,form,hint){var a=new URL(form.action,location.href),m=a.pathname.match(/\\/dispatch\\/chat\\/([^/?]+)/),sid=m?decodeURIComponent(m[1]):"",token=encodeURIComponent(a.searchParams.get("token")||""),fingerprint=[f.name,f.size,f.lastModified||0,f.type].join("|");return requestJson("/dispatch/video-upload/init?token="+token,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({originalName:f.name,mediaType:f.type,totalBytes:f.size,lastModified:f.lastModified||0,fingerprint:fingerprint,sessionId:sid})}).then(async function(init){var id=init.uploadId,offset=init.receivedBytes||0,chunk=init.chunkBytes||4194304;if(hint&&offset)hint.textContent="已恢复到 "+Math.round(offset/f.size*100)+"%";while(offset<f.size){var end=Math.min(offset+chunk,f.size),blob=f.slice(offset,end),done=false,last;for(var attempt=1;attempt<=3&&!done;attempt++){try{var b=await requestJson("/dispatch/video-upload/"+id+"/chunk?token="+token,{method:"POST",headers:{"Content-Type":"application/octet-stream","X-DSH-Upload-Offset":String(offset)},body:blob});offset=b.receivedBytes;done=true;if(hint)hint.textContent="正在上传视频 "+Math.round(offset/f.size*100)+"%（"+human(offset)+" / "+human(f.size)+"）"}catch(e){last=e;var expected=Number(e.expectedOffset);if(Number.isFinite(expected)&&expected>=end){offset=expected;done=true;break}if(Number.isFinite(expected))offset=expected;if(attempt<3){if(hint)hint.textContent="网络波动，正在重试第 "+attempt+" 次…";await sleep(attempt*1200)}}}if(!done)throw last}if(hint)hint.textContent="正在校验视频…";return requestJson("/dispatch/video-upload/"+id+"/complete?token="+token,{method:"POST"}).then(function(b){return b.video})})}',
+			'function hook(form){var input=form.querySelector("input[type=file]"),box=form.querySelector(".thumbs"),hint=form.querySelector(".img-hint"),bag=[];if(!input)return;function images(){return bag.filter(function(f){return f.type.indexOf("image/")===0})}function video(){return bag.find(function(f){return f.type.indexOf("video/")===0})}function draw(){if(!box)return;box.innerHTML="";var vid=video();if(hint)hint.textContent=(bag.length?("已选 "+images().length+" 张图片"+(vid?"、视频 "+vid.name+"（"+human(vid.size)+"）":"")+" · 点预览删除"):"可选图片或视频：最多20张图片、1个视频（最大200MB）");bag.forEach(function(f,i){if(f.type.indexOf("image/")===0){var im=document.createElement("img");im.alt="删";im.title="点一下删除";im.src=URL.createObjectURL(f);im.onclick=function(){bag.splice(i,1);draw()};box.appendChild(im)}else{var v=document.createElement("button");v.type="button";v.className="video-chip";v.textContent="🎬 "+f.name+" · "+human(f.size)+" · 点此删除";v.onclick=function(){bag.splice(i,1);draw()};box.appendChild(v)}})}',
+			'input.addEventListener("change",function(){[].slice.call(input.files||[]).forEach(function(f){var im=f.type.indexOf("image/")===0,vi=f.type.indexOf("video/")===0;if(!im&&!vi)return;if(vi){if(f.size>209715200){alert("视频不能超过200MB");return}bag=bag.filter(function(x){return x.type.indexOf("video/")!==0})}else if(images().length>=20)return;if(!bag.some(function(x){return key(x)===key(f)}))bag.push(f)});input.value="";draw()});draw();',
+			'form.addEventListener("submit",function(ev){if(!bag.length)return;ev.preventDefault();var btn=ev.submitter||form.querySelector("button[type=submit]"),old=btn&&btn.textContent,mode=(btn&&btn.name==="mode"&&btn.value)||"queue";if(btn){btn.disabled=true;btn.textContent="正在处理附件…"}form.classList.add("busy");var ims=images().slice(0,20),vid=video();Promise.all([Promise.all(ims.map(function(f){return pack(f).catch(function(){return null})})),vid?upload(vid,form,hint):Promise.resolve(null)]).then(function(p){var imgs=p[0].filter(Boolean),v=p[1];if(ims.length&&!imgs.length)throw new Error("图片读不出来，请换jpg/png再试");try{sessionStorage.removeItem("dsh-draft-"+location.pathname)}catch(e){}var body={text:(form.querySelector("textarea[name=text]")||{}).value||"",images:imgs,videos:v?[v]:[],mode:mode};["agentPreset","model","permission"].forEach(function(n){var e=form.querySelector("[name="+n+"]");if(e&&e.value)body[n]=e.value});if(btn)btn.textContent="正在提交到Harness…";return fetch(form.action,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body),credentials:"same-origin"}).then(function(r){if(!r.ok)return r.text().then(function(t){throw new Error(t.slice(0,180)||("HTTP "+r.status))});var loc=r.url||form.action;if(loc.indexOf("/dispatch/chat")>=0&&loc.indexOf("sent=")<0)loc+=(loc.indexOf("?")>=0?"&":"?")+"sent=1";location.href=loc})}).catch(function(e){alert("发送失败："+(e&&e.message||e));if(btn){btn.disabled=false;btn.textContent=old||"发送"}form.classList.remove("busy");draw()})})}',
+			'document.querySelectorAll("form.js-chat").forEach(hook)',
+			'})()</script>'
+		].join('')
+	}
+
 	pageShell(title, body, extraHead = '') {
 		return [
 			'<!doctype html><html><head><meta charset="utf-8">',
@@ -804,7 +1077,7 @@ export class DispatchService extends Service {
 			'.msg{margin:10px 0;padding:10px 12px;border-radius:12px;white-space:pre-wrap;word-break:break-word;line-height:1.45}',
 			'.pic{max-width:100%;border-radius:10px;margin-top:8px;display:block}',
 			'.thumbs{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}',
-			'.thumbs img{width:64px;height:64px;object-fit:cover;border-radius:8px}',
+			'.thumbs img{width:64px;height:64px;object-fit:cover;border-radius:8px}.video-chip{width:100%;text-align:left;background:#16253d;color:#e6f1ff;border:1px solid #355070;border-radius:9px;padding:10px}',
 			'input[type=file]{margin-top:8px;font:inherit;color:#8be9fd}',
 			'.busy{opacity:.7}',
 			'.user{background:#1c2541} .assistant{background:#193c3a}',
@@ -816,8 +1089,11 @@ export class DispatchService extends Service {
 			'.banner{background:#3d2b1f;border:1px solid #e09f3e;border-radius:12px;padding:12px;margin:12px 0}',
 			'.banner form{display:flex;gap:8px;padding:0;margin:8px 0 0}',
 			'.banner button{margin:0}',
-			'.question-banner{background:#132a3a;border:1px solid #3a86ff;border-radius:12px;padding:12px;margin:12px 0}',
-			'.question-form{padding:0;margin-top:10px}',
+			'.question-overlay{position:fixed;inset:0;z-index:1000;background:rgba(4,9,24,.72);display:flex;align-items:flex-start;justify-content:center;padding:64px 12px 16px;box-sizing:border-box;backdrop-filter:blur(3px)}.question-overlay[hidden]{display:none}',
+			'.question-modal{width:min(720px,100%);max-height:calc(100vh - 80px);background:#132a3a;border:1px solid #3a86ff;border-radius:14px;box-shadow:0 18px 55px rgba(0,0,0,.55);display:flex;flex-direction:column;overflow:hidden}',
+			'.question-modal-head{display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid #31506d;background:#10283a;flex:none}.question-modal-head strong{font-size:17px}.question-count{font-size:13px;opacity:.7}.question-minimize{margin:0 0 0 auto;background:#33415c;padding:7px 11px}',
+			'.question-scroll{overflow:auto;padding:0 14px 14px}.question-form{padding:0;margin-top:10px}.question-actions{display:flex;gap:8px;flex-wrap:wrap;position:sticky;bottom:0;background:#132a3a;padding:8px 0}.question-skip{background:#5c677d}',
+			'.question-reminder{position:fixed;z-index:1001;top:52px;left:50%;transform:translateX(-50%);width:min(696px,calc(100% - 24px));box-sizing:border-box;background:#7a4d00;border:1px solid #ffb703;border-radius:0 0 12px 12px;padding:9px 12px;box-shadow:0 8px 22px rgba(0,0,0,.45);display:flex;align-items:center;gap:8px}.question-reminder[hidden]{display:none}.question-reminder button{margin:0 0 0 auto;padding:7px 11px}.question-open{overflow:hidden}',
 			'.question-field{border:1px solid #3a506b;border-radius:10px;margin:10px 0;padding:10px}',
 			'.question-field legend{color:#8be9fd;padding:0 6px}',
 			'.question-text{font-weight:600;margin-bottom:8px;white-space:pre-wrap}',
@@ -825,6 +1101,7 @@ export class DispatchService extends Service {
 			'.question-option input{width:20px;height:20px;flex:none;margin:1px 0 0}',
 			'.question-option small{display:block;opacity:.65;margin-top:3px}',
 			'.question-custom{display:block;margin-top:10px}.question-custom span{display:block;font-size:13px;opacity:.7;margin-bottom:5px}',
+			'.history-cards{margin:12px 0}.history-cards h3{font-size:15px;color:#8be9fd}.history-card{background:#101f32;border:1px solid #355070;border-radius:10px;padding:8px 12px;margin:8px 0}.history-card summary{cursor:pointer;font-weight:600}.history-summary{white-space:pre-wrap;line-height:1.5;margin:10px 0}',
 			'.deny{background:#6c757d}.composer-actions{display:flex;gap:8px;flex-wrap:wrap}.composer-actions .steer{background:#e09f3e;color:#111}',
 			'#voice-bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:8px 0 12px;padding:10px 12px;background:#111a33;border:1px solid #3a506b;border-radius:12px}',
 			'#voice-bar button{margin:0}',
@@ -880,6 +1157,25 @@ export class DispatchService extends Service {
 				}
 				return this.sendJson(res, 401, { ok: false, error: 'unauthorized' })
 			}
+			if (route === '/dispatch/video-upload/init' && req.method === 'POST') {
+				try {
+					const fields = await this.readForm(req, urlObj)
+					return this.sendJson(res, 200, { ok: true, ...this.initVideoUpload(fields) })
+				} catch (err) { return this.sendJson(res, Number(err?.statusCode || 500), { ok: false, error: String(err?.message || err) }) }
+			}
+			const videoChunkMatch = route.match(/^\/dispatch\/video-upload\/([^/]+)\/chunk$/)
+			if (videoChunkMatch && req.method === 'POST') {
+				try { return this.sendJson(res, 200, { ok: true, ...(await this.receiveVideoChunk(req, videoChunkMatch[1])) }) }
+				catch (err) { return this.sendJson(res, Number(err?.statusCode || 500), { ok: false, error: String(err?.message || err), expectedOffset: err?.expectedOffset }) }
+			}
+			const videoCompleteMatch = route.match(/^\/dispatch\/video-upload\/([^/]+)\/complete$/)
+			if (videoCompleteMatch && req.method === 'POST') {
+				try {
+					const video = this.completeVideoUpload(videoCompleteMatch[1])
+					this.note('video-uploaded', { sessionId: video.sessionId, mediaType: video.mediaType, bytes: video.bytes, storedPath: video.storedPath })
+					return this.sendJson(res, 200, { ok: true, video })
+				} catch (err) { return this.sendJson(res, Number(err?.statusCode || 500), { ok: false, error: String(err?.message || err), expectedOffset: err?.expectedOffset }) }
+			}
 			if (route === '/dispatch/status' && req.method === 'GET') {
 				return this.sendJson(res, 200, {
 					ok: true,
@@ -907,6 +1203,68 @@ export class DispatchService extends Service {
 					if (row) title = this.sessionTitleOf(row)
 				} catch { /* fallback */ }
 				return this.sendJson(res, 200, { ok: true, sessionId, title, result: record || null })
+			}
+			if (route === '/dispatch/history-search' && req.method === 'POST') {
+				const fields = await this.readForm(req, urlObj)
+				if (fields.stage === 'tags') {
+					const listed = await this.client.sessions.list({})
+					if (!listed.result.ok) return this.sendJson(res, 502, { ok: false, error: listed.result.error })
+					const matches = this.searchSessionDigests(fields.criteria || {}, listed.result.value.items ?? [], String(fields.preferredSessionId || ''))
+					return this.sendJson(res, 200, { ok: true, stage: 'tags', matches })
+				}
+				const queries = Array.isArray(fields.queries) ? fields.queries : [fields.query]
+				const excludedSessionIds = Array.isArray(fields.excludedSessionIds) ? fields.excludedSessionIds.map(String) : []
+				const result = await this.searchHistory(queries, String(fields.preferredSessionId || ''), excludedSessionIds)
+				return this.sendJson(res, 200, { ok: true, stage: 'literal', ...result })
+			}
+			if (route === '/dispatch/session-digests/pending' && req.method === 'GET') {
+				const excludedSessionIds = String(urlObj.searchParams.get('exclude') || '').split(',').filter(Boolean)
+				const items = await this.pendingSessionDigests(urlObj.searchParams.get('limit'), excludedSessionIds)
+				return this.sendJson(res, 200, { ok: true, items })
+			}
+			if (route === '/dispatch/session-tag-catalog' && req.method === 'GET') return this.sendJson(res, 200, { ok: true, catalog: this.tagCatalog() })
+			if (route === '/dispatch/session-digest' && req.method === 'POST') {
+				const fields = await this.readForm(req, urlObj)
+				const sessionId = String(fields.sessionId || '')
+				if (!sessionId) return this.sendJson(res, 400, { ok: false, error: 'sessionId-required' })
+				const digest = this.normalizeDigest(sessionId, fields.digest || {}, fields.metadata || {})
+				this.sessionDigests.set(sessionId, digest)
+				this.persistSessionDigests()
+				return this.sendJson(res, 200, { ok: true, digest })
+			}
+			const historyMatch = route.match(/^\/dispatch\/session-history\/([^/]+)$/)
+			if (historyMatch && req.method === 'GET') {
+				const sessionId = decodeURIComponent(historyMatch[1])
+				const page = await this.sessionHistoryPage(sessionId, urlObj.searchParams.get('beforeSeq'), urlObj.searchParams.get('maxMessages'))
+				let title = sessionId.slice(-12)
+				try {
+					const listed = await this.client.sessions.list({})
+					const row = listed.result.ok ? (listed.result.value.items ?? []).find((s) => s.sessionId === sessionId) : null
+					if (row) title = this.sessionTitleOf(row)
+				} catch { /* fallback */ }
+				return this.sendJson(res, 200, { ok: true, sessionId, title, ...page })
+			}
+			if (route === '/dispatch/history-card/delete' && req.method === 'GET') {
+				const scope = String(urlObj.searchParams.get('scope') || '').slice(0, 200)
+				const cardId = String(urlObj.searchParams.get('cardId') || '')
+				if (scope && cardId) {
+					const rows = (this.historyCards.get(scope) ?? []).filter((card) => card.id !== cardId)
+					if (rows.length) this.historyCards.set(scope, rows)
+					else this.historyCards.delete(scope)
+					this.persistHistoryCards()
+				}
+				return this.redirect(res, scope && scope !== 'global' ? this.chatPath(scope) : this.chatPath())
+			}
+			if (route === '/dispatch/history-card' && req.method === 'POST') {
+				const fields = await this.readForm(req, urlObj)
+				const scope = String(fields.scope || 'global').slice(0, 200)
+				const summary = String(fields.summary || '').trim().slice(0, 12000)
+				if (!summary) return this.sendJson(res, 400, { ok: false, error: 'summary-required' })
+				const sources = (Array.isArray(fields.sources) ? fields.sources : []).slice(0, 8).map((source) => ({
+					sessionId: String(source?.sessionId || ''), title: String(source?.title || '').slice(0, 160), snippet: String(source?.snippet || '').slice(0, 1000)
+				})).filter((source) => source.sessionId)
+				const card = this.saveHistoryCard(scope, { query: String(fields.query || '').slice(0, 500), summary, sources })
+				return this.sendJson(res, 200, { ok: true, card })
 			}
 			if (route === '/dispatch/sessions' && req.method === 'GET') {
 				const listed = await this.client.sessions.list({})
@@ -965,7 +1323,7 @@ export class DispatchService extends Service {
 		}
 	}
 
-	renderQuestionBanner(rpcId, entry, returnSessionId) {
+	renderQuestionModal(rpcId, entry, returnSessionId, position = 1, total = 1) {
 		const fields = entry.questions.map((q, qi) => {
 			const multi = q.multiSelect === true
 			const type = multi ? 'checkbox' : 'radio'
@@ -985,13 +1343,20 @@ export class DispatchService extends Service {
 				'</fieldset>'
 			].join('')
 		}).join('')
+		const count = total > 1 ? ` <span class="question-count">${position}/${total}</span>` : ''
 		return [
-			'<div class="question-banner"><strong>需要你回答</strong>',
-			'<form class="question-form" method="post" action="/dispatch/question?token=' + encodeURIComponent(this.config.token) + '">',
+			'<div class="question-reminder" hidden><strong>⚠️ 任务正在等待你的回答' + count + '</strong><button type="button" data-question-open>立即处理</button></div>',
+			'<div class="question-overlay" role="dialog" aria-modal="true" aria-labelledby="question-title">',
+			'<section class="question-modal"><div class="question-modal-head"><strong id="question-title">需要你回答' + count + '</strong><button type="button" class="question-minimize" data-question-minimize>暂时收起</button></div>',
+			'<div class="question-scroll"><form class="question-form" method="post" action="/dispatch/question?token=' + encodeURIComponent(this.config.token) + '">',
 			'<input type="hidden" name="rpcId" value="' + this.escHtml(rpcId) + '">',
 			'<input type="hidden" name="returnSessionId" value="' + this.escHtml(returnSessionId) + '">',
 			fields,
-			'<button type="submit">提交回答</button></form></div>'
+			'<div class="question-actions"><button type="submit" name="questionAction" value="answer">提交回答</button>',
+			'<button type="submit" name="questionAction" value="skip" class="question-skip" formnovalidate>跳过本次并继续</button></div>',
+			'<p class="muted">跳过会明确告知助手依据现有信息自行判断并继续，不是仅关闭窗口。</p>',
+			'</form></div></section></div>',
+			'<script>(function(){var o=document.querySelector(".question-overlay"),r=document.querySelector(".question-reminder"),a=document.querySelector("[data-question-minimize]"),b=document.querySelector("[data-question-open]");if(!o||!r)return;function set(open){o.hidden=!open;r.hidden=open;document.body.classList.toggle("question-open",open)}if(a)a.onclick=function(){set(false)};if(b)b.onclick=function(){set(true)};set(true)})()</script>'
 		].join('')
 	}
 
@@ -1004,7 +1369,10 @@ export class DispatchService extends Service {
 			return this.sendResultPage(res, '⏳', '这个问题已经回答', '可能电脑端已经先行提交，无需重复操作。',
 				returnSessionId ? `<p style="margin-top:20px"><a href="${this.escHtml(this.chatPath(returnSessionId))}" style="color:#8be9fd">返回会话</a></p>` : '')
 		}
+		const action = String(fields.questionAction || 'answer')
+		const skipped = action === 'skip'
 		const answers = entry.questions.map((q, qi) => {
+			if (skipped) return { id: q.id, selected: [], custom: '用户选择跳过本题，请依据已有信息自行判断并继续。' }
 			const selected = []
 			if (q.multiSelect === true) {
 				for (let oi = 0; oi < (q.options ?? []).length; oi += 1) {
@@ -1032,7 +1400,7 @@ export class DispatchService extends Service {
 				returnSessionId ? `<p style="margin-top:20px"><a href="${this.escHtml(this.chatPath(returnSessionId))}" style="color:#8be9fd">返回会话</a></p>` : '')
 		}
 		this.pendingQuestions.delete(rpcId)
-		this.note('question-answered', { rpcId, sessionId: entry.sessionId, answers })
+		this.note(skipped ? 'question-skipped' : 'question-answered', { rpcId, sessionId: entry.sessionId, answers })
 		return this.redirect(res, this.chatPath(returnSessionId || entry.sessionId))
 	}
 
@@ -1069,6 +1437,221 @@ export class DispatchService extends Service {
 			outcome === 'allowed-once' ? '已批准 · 会话继续' : '已拒绝',
 			'session …' + sessionId.slice(-12),
 			sessionId ? `<p style="margin-top:20px"><a href="${this.escHtml(this.chatPath(sessionId))}" style="color:#8be9fd">打开会话 · 看回复 / 续聊</a></p>` : '')
+	}
+
+	normalizeSearchText(value) {
+		return String(value || '').toLowerCase().replace(/[\s，。！？、,.!?“”"'：:；;（）()\[\]【】_-]+/g, '')
+	}
+
+	async rebuildFallbackHistoryIndex(summaries) {
+		let changed = false
+		for (const summary of summaries) {
+			const cached = this.historySearchIndex.get(summary.sessionId)
+			if (cached && Number(cached.sourceSeq || 0) > 0 && Object.hasOwn(cached, 'latestCompaction') && Number(cached.updatedAt || 0) === Number(summary.updatedAt || 0)) continue
+			const all = []
+			const allEvents = []
+			let beforeSeq
+			for (let page = 0; page < 5; page += 1) {
+				const request = { sessionId: summary.sessionId, maxMessages: 100 }
+				if (beforeSeq !== undefined) request.beforeSeq = beforeSeq
+				const hist = await this.client.sessions.history(request)
+				if (!hist.result.ok) break
+				const events = hist.result.value.events ?? []
+				all.unshift(...this.foldHistory(events))
+				allEvents.unshift(...events)
+				let minSeq
+				for (const entry of events) {
+					const seq = Number(entry?.seq)
+					if (Number.isInteger(seq) && (minSeq === undefined || seq < minSeq)) minSeq = seq
+				}
+				if (!hist.result.value.hasMore || minSeq === undefined) break
+				beforeSeq = minSeq
+			}
+			const messages = all.slice(-400).map((m) => ({ role: m.role, text: String(m.text || '').slice(0, 6000), time: m.time || 0 })).filter((m) => m.text)
+			let latestCompaction = null
+			let sourceSeq = 0
+			for (const entry of allEvents) {
+				const seq = Number(entry?.event?.seq || entry?.seq || 0)
+				if (seq > sourceSeq) sourceSeq = seq
+				const ev = entry?.event ?? entry
+				if (ev?.type === 'compaction/summary') {
+					latestCompaction = { compactionId: String(ev.data?.compactionId || ''), summary: this.blocksText(ev.data?.summary), seq }
+				}
+			}
+			this.historySearchIndex.set(summary.sessionId, { updatedAt: summary.updatedAt ?? 0, sourceSeq, latestCompaction, messages })
+			changed = true
+		}
+		const visible = new Set(summaries.map((s) => s.sessionId))
+		for (const id of this.historySearchIndex.keys()) if (!visible.has(id)) { this.historySearchIndex.delete(id); changed = true }
+		if (changed) this.persistHistorySearchIndex()
+	}
+
+	literalHistorySearch(cleanQueries, summaries, preferredSessionId) {
+		const terms = [...new Set(cleanQueries.flatMap((query) => [query, ...String(query).split(/[\s，。！？、,.!?：:；;]+/)])
+			.map((term) => this.normalizeSearchText(term)).filter((term) => term.length >= 2))]
+		const results = []
+		for (const summary of summaries) {
+			const indexed = this.historySearchIndex.get(summary.sessionId)
+			if (!indexed) continue
+			const ranked = []
+			for (const message of indexed.messages ?? []) {
+				const normalized = this.normalizeSearchText(message.text)
+				let score = 0
+				for (const term of terms) if (normalized.includes(term)) score += term === this.normalizeSearchText(cleanQueries[0]) ? 30 : Math.min(12, term.length * 2)
+				if (score > 0) ranked.push({ message, score })
+			}
+			ranked.sort((a, b) => b.score - a.score)
+			if (!ranked.length) continue
+			let score = ranked[0].score + (ranked[1]?.score || 0) * 0.2
+			if (preferredSessionId && summary.sessionId === preferredSessionId) score += 8
+			results.push({ sessionId: summary.sessionId, snippets: ranked.slice(0, 3).map((x) => String(x.message.text).replace(/\s+/g, ' ').slice(0, 700)), queries: cleanQueries, score: Math.round(score * 10) / 10 })
+		}
+		return results.sort((a, b) => b.score - a.score).slice(0, 12)
+	}
+
+	async searchHistory(queries, preferredSessionId = '', excludedSessionIds = []) {
+		const cleanQueries = [...new Set((Array.isArray(queries) ? queries : [queries])
+			.map((q) => String(q || '').trim().slice(0, 500)).filter(Boolean))].slice(0, 8)
+		if (!cleanQueries.length) throw new Error('至少需要一个搜索词')
+		const listed = await this.client.sessions.list({})
+		if (!listed.result.ok) throw new Error(JSON.stringify(listed.result.error))
+		const excluded = new Set(excludedSessionIds)
+		const summaries = (listed.result.value.items ?? []).filter((s) => !excluded.has(s.sessionId))
+		const byId = new Map(summaries.map((s) => [s.sessionId, s]))
+		const archived = await this.archivedIdSet()
+		const merged = new Map()
+		let hasMore = false
+		let officialDisabled = false
+		for (const query of cleanQueries) {
+			const found = await this.client.sessions.search({ query })
+			if (!found.result.ok) {
+				const detail = JSON.stringify(found.result.error)
+				if (/session search is disabled|openAt.*never/i.test(detail)) { officialDisabled = true; break }
+				throw new Error(detail)
+			}
+			hasMore ||= Boolean(found.result.value.hasMore)
+			for (const hit of found.result.value.items ?? []) {
+				const current = merged.get(hit.sessionId) ?? { sessionId: hit.sessionId, snippets: [], queries: [], score: 0 }
+				if (!current.snippets.includes(hit.snippet)) current.snippets.push(hit.snippet)
+				if (!current.queries.includes(query)) current.queries.push(query)
+				current.score += 10 + Math.min(20, hit.snippet.length / 20)
+				if (preferredSessionId && hit.sessionId === preferredSessionId) current.score += 60
+				merged.set(hit.sessionId, current)
+			}
+		}
+		if (officialDisabled) {
+			await this.rebuildFallbackHistoryIndex(summaries)
+			for (const row of this.literalHistorySearch(cleanQueries, summaries, preferredSessionId)) merged.set(row.sessionId, row)
+		}
+		const matches = [...merged.values()].map((row) => {
+			const summary = byId.get(row.sessionId)
+			return {
+				...row,
+				title: this.sessionTitleOf(summary) || row.sessionId.slice(-12),
+				updatedAt: summary?.updatedAt ?? 0,
+				archived: archived.has(row.sessionId),
+				origin: summary?.origin || 'user',
+				parentSessionId: summary?.parentSessionId || ''
+			}
+		}).sort((a, b) => b.score - a.score || Number(b.updatedAt || 0) - Number(a.updatedAt || 0)).slice(0, 12)
+		return { queries: cleanQueries, matches, hasMore, searchBackend: officialDisabled ? 'local-history-index' : 'harness-session-search' }
+	}
+
+	searchSessionDigests(criteria, summaries, preferredSessionId = '') {
+		const wanted = ['topics', 'subjects', 'problems', 'carriers', 'outcomes', 'keywords']
+		const termsByField = Object.fromEntries(wanted.map((field) => [field, (Array.isArray(criteria?.[field]) ? criteria[field] : []).map((x) => this.normalizeSearchText(x)).filter((x) => x.length >= 2)]))
+		const allTerms = wanted.flatMap((field) => termsByField[field])
+		const from = Number(criteria?.from || 0)
+		const to = Number(criteria?.to || 0)
+		const byId = new Map(summaries.map((s) => [s.sessionId, s]))
+		const matches = []
+		for (const digest of this.sessionDigests.values()) {
+			const updatedAt = Number(digest.lastRelevantAt || digest.updatedAt || 0)
+			if (from && updatedAt < from) continue
+			if (to && updatedAt > to) continue
+			let score = 0
+			const hits = []
+			for (const field of wanted) {
+				const weight = field === 'subjects' ? 35 : field === 'problems' ? 30 : field === 'topics' ? 24 : field === 'carriers' ? 18 : 14
+				for (const value of digest[field] ?? []) {
+					const normalized = this.normalizeSearchText(value)
+					for (const term of termsByField[field]) if (normalized.includes(term) || term.includes(normalized)) { score += weight; hits.push(`${field}:${value}`); break }
+				}
+			}
+			const haystack = this.normalizeSearchText([digest.title, digest.summary].join(' '))
+			for (const term of allTerms) if (haystack.includes(term)) score += 6
+			if (preferredSessionId && digest.sessionId === preferredSessionId && score > 0) score += 8
+			if (score > 0 && hits.length > 0) {
+				const summary = byId.get(digest.sessionId)
+				matches.push({ sessionId: digest.sessionId, title: digest.title || this.sessionTitleOf(summary), score, snippets: [digest.summary], tagHits: [...new Set(hits)].slice(0, 12), updatedAt })
+			}
+		}
+		return matches.sort((a, b) => b.score - a.score || b.updatedAt - a.updatedAt).slice(0, 12)
+	}
+
+	async pendingSessionDigests(limit = 5, excludedSessionIds = []) {
+		const listed = await this.client.sessions.list({})
+		if (!listed.result.ok) throw new Error(JSON.stringify(listed.result.error))
+		const excluded = new Set(excludedSessionIds)
+		const summaries = (listed.result.value.items ?? []).filter((s) => !s.blank && !excluded.has(s.sessionId))
+		await this.rebuildFallbackHistoryIndex(summaries)
+		const pending = []
+		for (const summary of summaries) {
+			const source = this.historySearchIndex.get(summary.sessionId)
+			const digest = this.sessionDigests.get(summary.sessionId)
+			if (!source || (digest && Number(digest.sourceSeq || 0) >= Number(source.sourceSeq || 0) && Number(digest.updatedAt || 0) === Number(summary.updatedAt || 0))) continue
+			const turn = this.turnResults.get(summary.sessionId)
+			pending.push({
+				sessionId: summary.sessionId, title: this.sessionTitleOf(summary), updatedAt: summary.updatedAt || 0,
+				sourceSeq: source.sourceSeq || 0, compactionId: source.latestCompaction?.compactionId || '', compactionSummary: source.latestCompaction?.summary || '',
+				turnResult: turn ? { instruction: turn.instruction || '', result: turn.result || '' } : null,
+				messages: (source.messages || []).slice(-80)
+			})
+			if (pending.length >= Math.max(1, Math.min(20, Number(limit) || 5))) break
+		}
+		return pending
+	}
+
+	tagCatalog() {
+		const out = { topics: [], subjects: [], problems: [], carriers: [], outcomes: [], keywords: [] }
+		for (const digest of this.sessionDigests.values()) for (const key of Object.keys(out)) out[key].push(...(digest[key] || []))
+		for (const key of Object.keys(out)) out[key] = [...new Set(out[key])].slice(0, 500)
+		return out
+	}
+
+	async sessionHistoryPage(sessionId, beforeSeq, maxMessages = 60) {
+		const request = { sessionId, maxMessages: Math.max(1, Math.min(100, Number(maxMessages) || 60)) }
+		if (Number.isInteger(Number(beforeSeq)) && Number(beforeSeq) >= 0) request.beforeSeq = Number(beforeSeq)
+		const hist = await this.client.sessions.history(request)
+		if (!hist.result.ok) throw new Error(JSON.stringify(hist.result.error))
+		const events = hist.result.value.events ?? []
+		const messages = this.foldHistory(events)
+		let nextBeforeSeq
+		for (const entry of events) {
+			const seq = Number(entry?.seq)
+			if (Number.isInteger(seq) && (nextBeforeSeq === undefined || seq < nextBeforeSeq)) nextBeforeSeq = seq
+		}
+		return { messages, hasMore: Boolean(hist.result.value.hasMore), nextBeforeSeq }
+	}
+
+	saveHistoryCard(scope, card) {
+		const key = String(scope || 'global')
+		const rows = this.historyCards.get(key) ?? []
+		rows.unshift({ ...card, id: card.id || randomBytes(8).toString('hex'), createdAt: card.createdAt || Date.now() })
+		this.historyCards.set(key, rows.slice(0, 20))
+		this.persistHistoryCards()
+		return rows[0]
+	}
+
+	renderHistoryCards(scope) {
+		const rows = this.historyCards.get(String(scope || 'global')) ?? []
+		if (!rows.length) return ''
+		const key = String(scope || 'global')
+		return '<details class="history-cards"><summary><strong>历史搜索结果（' + rows.length + '）</strong></summary>' + rows.slice(0, 5).map((card) => {
+			const sources = (card.sources ?? []).map((source) => '<a href="' + this.escHtml(this.chatPath(source.sessionId)) + '">' + this.escHtml(source.title || source.sessionId.slice(-12)) + '</a>').join('；')
+			const del = '<a class="muted" style="float:right" href="/dispatch/history-card/delete?scope=' + encodeURIComponent(key) + '&cardId=' + encodeURIComponent(card.id) + '&token=' + encodeURIComponent(this.config.token) + '" onclick="return confirm(\'清除这条历史搜索结果？\')">清除</a>'
+			return '<details class="history-card"><summary>' + this.escHtml(card.query || '历史查询') + '</summary>' + del + '<div class="history-summary">' + this.escHtml(card.summary || '') + '</div>' + (sources ? '<div class="muted">来源：' + sources + '</div>' : '') + '</details>'
+		}).join('') + '</details>'
 	}
 
 	async archivedIdSet() {
@@ -1150,8 +1733,8 @@ export class DispatchService extends Service {
 		const composer = showArchived ? '' : [
 			'<form class="js-chat" method="post" action="' + this.escHtml(this.chatPath()) + '" enctype="multipart/form-data">',
 			'<textarea name="text" rows="3" placeholder="新开一个会话，说你要它干什么…"></textarea>',
-			'<input type="file" name="images" accept="image/jpeg,image/png,image/webp,image/gif" multiple>',
-			'<div class="thumbs"></div><p class="muted img-hint">点选图，再选会追加，最多 20 张</p>',
+			'<input type="file" name="attachments" accept="image/jpeg,image/png,image/webp,image/gif,video/mp4,video/webm,video/quicktime" multiple>',
+			'<div class="thumbs"></div><p class="muted img-hint">可选图片或视频：最多20张图片、1个视频（最大200MB）</p>',
 			'<div class="composer-actions"><button type="submit">发送</button></div>',
 			'<details class="adv"><summary>高级 · 模型 / 模式 / 权限</summary>',
 			modelOpts,
@@ -1167,7 +1750,7 @@ export class DispatchService extends Service {
 			showArchived ? '' : this.voicePanel({ token: this.config.token, mode: 'global' }),
 			nav, composer,
 			rows || '<p class="muted">' + empty + '</p>',
-			advJs, this.sendJs(), showArchived ? '' : this.voiceJs(),
+			advJs, this.sendAttachmentJs(), showArchived ? '' : this.voiceJs(),
 			'</main>'
 		].join('')
 		this.sendHtml(res, this.pageShell(heading, body))
@@ -1177,7 +1760,8 @@ export class DispatchService extends Service {
 		const fields = await this.readForm(req, urlObj)
 		const text = (fields.text ?? '').trim()
 		const images = this.formImages(fields)
-		if (!text && !images.length) return this.sendHtml(res, this.pageShell('dsh', '<main><p>内容不能为空</p></main>'), 400)
+		const video = this.formVideos(fields)[0]
+		if (!text && !images.length && !video) return this.sendHtml(res, this.pageShell('dsh', '<main><p>内容不能为空</p></main>'), 400)
 		const createReq = {}
 		const agentPreset = (fields.agentPreset ?? '').trim()
 		if (agentPreset) createReq.agentPreset = agentPreset
@@ -1196,11 +1780,12 @@ export class DispatchService extends Service {
 		const prompted = await this.client.sessions.prompt({
 			sessionId,
 			mode: 'queue',
-			content: this.promptContent(text, images)
+			content: this.promptContent(text, images, video)
 		})
 		if (!prompted.result.ok) return this.sendJson(res, 502, { ok: false, stage: 'prompt', sessionId, error: prompted.result.error })
-		this.note('task', { sessionId, mode: 'queue', text: (text || '（图片）').slice(0, 120) })
-		this.trackedTasks.set(sessionId, { snippet: (text || '（图片）').slice(0, 80).replace(/\s+/g, ' '), at: Date.now() })
+		const taskLabel = text || (video ? '（视频）' : '（图片）')
+		this.note('task', { sessionId, mode: 'queue', text: taskLabel.slice(0, 120) })
+		this.trackedTasks.set(sessionId, { snippet: taskLabel.slice(0, 80).replace(/\s+/g, ' '), at: Date.now() })
 		this.log(`chat dispatched → ${sessionId}`)
 		this.redirect(res, this.chatPath(sessionId) + '&sent=1')
 	}
@@ -1316,8 +1901,8 @@ export class DispatchService extends Service {
 				'</p></div>'
 			].join('')
 		}).join('')
-		const questionsHere = [...this.pendingQuestions.entries()].filter(([, e]) => sessionTree.has(e.sessionId))
-		const questionBanners = questionsHere.map(([rpcId, e]) => this.renderQuestionBanner(rpcId, e, sessionId)).join('')
+		const questionsHere = [...this.pendingQuestions.entries()].filter(([, e]) => sessionTree.has(e.sessionId)).sort((a, b) => a[1].at - b[1].at)
+		const questionModal = questionsHere.length ? this.renderQuestionModal(questionsHere[0][0], questionsHere[0][1], sessionId, 1, questionsHere.length) : ''
 		const running = await this.sessionRunning(sessionId)
 		const last = folded[folded.length - 1]
 		const awaitingReply = !last || last.role === 'user'
@@ -1425,20 +2010,22 @@ export class DispatchService extends Service {
 		const lastAssistant = last?.role === 'assistant' ? String(last.text || '').slice(0, 2500) : ''
 		const body = [
 			'<header class="chat-header"><a href="' + this.escHtml(this.chatPath()) + '">← 会话列表</a><strong style="margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + this.escHtml(currentTitle) + '</strong></header>',
-			'<main>', extra, banners, questionBanners,
+			questionModal,
+			'<main>', extra, banners,
+			this.renderHistoryCards(sessionId),
 			this.voicePanel({ sessionId, title: currentTitle, token: this.config.token, mode: 'session' }),
 			msgs,
 			'<form id="composer" class="js-chat" method="post" action="' + this.escHtml(this.chatPath(sessionId)) + '" enctype="multipart/form-data">',
 			'<textarea name="text" rows="3" placeholder="继续说…"></textarea>',
-			'<input type="file" name="images" accept="image/jpeg,image/png,image/webp,image/gif" multiple>',
-			'<div class="thumbs"></div><p class="muted img-hint">点选图，再选会追加，最多 20 张</p>',
+			'<input type="file" name="attachments" accept="image/jpeg,image/png,image/webp,image/gif,video/mp4,video/webm,video/quicktime" multiple>',
+			'<div class="thumbs"></div><p class="muted img-hint">可选图片或视频：最多20张图片、1个视频（最大200MB）</p>',
 			'<div class="composer-actions"><button type="submit" name="mode" value="queue">发送续聊</button><button type="submit" name="mode" value="steer" class="steer">⚡ 插队发送</button></div>',
 			'<p class="muted">插队会尽快注入当前运行轮次；当前轮次已结束时自动转为普通续聊。</p></form>',
 			'<details class="adv"><summary>高级 · 模型 / 权限 / 改名</summary>',
 			modelForm, permForm, renameForm,
 			'<p class="muted">' + archiveLink + '</p>',
 			'</details>',
-			draftJs, this.sendJs(), this.voiceJs(),
+			draftJs, this.sendAttachmentJs(), this.voiceJs(),
 			'</main>'
 		].join('')
 		this.sendHtml(res, this.pageShell(currentTitle, body))
@@ -1448,8 +2035,9 @@ export class DispatchService extends Service {
 		const sessionId = decodeURIComponent(rawId.split('?')[0])
 		const fields = await this.readForm(req, urlObj)
 		const images = this.formImages(fields)
+		const video = this.formVideos(fields)[0]
 		const title = (fields.title ?? '').trim()
-		if (title && !(fields.text ?? '').trim() && !images.length) {
+		if (title && !(fields.text ?? '').trim() && !images.length && !video) {
 			const renamed = await this.client.sessions.rename({ sessionId, title })
 			if (!renamed.result.ok) {
 				return this.sendHtml(res, this.pageShell('改名失败', `<main><p>${this.escHtml(JSON.stringify(renamed.result.error))}</p><p><a href="${this.escHtml(this.chatPath(sessionId))}">返回会话</a></p></main>`), 502)
@@ -1458,9 +2046,9 @@ export class DispatchService extends Service {
 			return this.redirect(res, this.chatPath(sessionId))
 		}
 		const text = (fields.text ?? '').trim()
-		if (!text && !images.length) return this.redirect(res, this.chatPath(sessionId))
+		if (!text && !images.length && !video) return this.redirect(res, this.chatPath(sessionId))
 		const requestedMode = String(fields.mode || '') === 'steer' ? 'steer' : 'queue'
-		const content = this.promptContent(text, images)
+		const content = this.promptContent(text, images, video)
 		let actualMode = requestedMode
 		let prompted = await this.client.sessions.prompt({ sessionId, mode: actualMode, content })
 		if (!prompted.result.ok && requestedMode === 'steer') {
@@ -1474,8 +2062,9 @@ export class DispatchService extends Service {
 		if (!prompted.result.ok) {
 			return this.sendHtml(res, this.pageShell('发送失败', `<main><p>${this.escHtml(JSON.stringify(prompted.result.error))}</p></main>`), 502)
 		}
-		this.note('task', { sessionId, mode: actualMode, requestedMode, text: (text || '（图片）').slice(0, 120) })
-		this.trackedTasks.set(sessionId, { snippet: (text || '（图片）').slice(0, 80).replace(/\s+/g, ' '), at: Date.now() })
+		const taskLabel = text || (video ? '（视频）' : '（图片）')
+		this.note('task', { sessionId, mode: actualMode, requestedMode, text: taskLabel.slice(0, 120) })
+		this.trackedTasks.set(sessionId, { snippet: taskLabel.slice(0, 80).replace(/\s+/g, ' '), at: Date.now() })
 		this.log(`chat reply → ${sessionId} mode=${actualMode} requested=${requestedMode}`)
 		const flag = requestedMode === 'steer' ? (actualMode === 'steer' ? '&steered=1' : '&steerFallback=1') : '&sent=1'
 		this.redirect(res, this.chatPath(sessionId) + flag)

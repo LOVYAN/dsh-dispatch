@@ -104,3 +104,8 @@ server.listen(cfg.port, cfg.host, () => {
 	log(`volc ${volcReady(cfg) ? 'configured' : 'MISSING apiKey — 通话不可用，工头通道仍可测'}`)
 	log(`open http://127.0.0.1:${cfg.port}/?token=<dispatch-token>`)
 })
+
+// Keep the detached gateway process alive without running history-index work.
+const gatewayKeepAlive = setInterval(() => {}, 60 * 60 * 1000)
+process.once('SIGINT', () => { clearInterval(gatewayKeepAlive); server.close(() => process.exit(0)) })
+process.once('SIGTERM', () => { clearInterval(gatewayKeepAlive); server.close(() => process.exit(0)) })

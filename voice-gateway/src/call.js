@@ -1,7 +1,7 @@
 import { WebSocket } from 'ws'
 import { looksLikeConfirmDispatch, looksLikeWork, summarizeForSpeech } from './summarize.js'
 import { normalizeHarnessSpeech } from './semantic.js'
-import { dispatchIndependentTask, handleBoundSessionUtterance, handleUserUtterance, inspectBoundSession, listDispatchSessions, matchDispatchSessions, summarizeActiveSessions } from './foreman.js'
+import { dispatchIndependentTask, fetchDispatchHistory, fetchSessionTagCatalog, handleBoundSessionUtterance, handleUserUtterance, inspectBoundSession, listDispatchSessions, matchDispatchSessions, planTagSearch, saveDispatchHistoryCard, searchDispatchHistory, searchDispatchTags, summarizeActiveSessions, summarizeHistoryEvidence, updatePendingSessionDigests } from './foreman.js'
 import {
 	connectVolc,
 	sessionCreatePayload,
@@ -447,7 +447,7 @@ export function attachCall(cfg, phoneWs, log, { targetSessionId = '', targetTitl
 				&& /^(读|念|说|讲|汇报|总结|复述|查看|读取)?(一下|一下子)?(当前|这个|本次|我们)?(对话|会话|聊天)?的?(执行)?(结果|结论|小结)[。！？，,]?$/u.test(text.trim())
 			const quickContinue = /^(继续|继续读|接着读|往下读|继续汇报|接着汇报)[。！？，,]?$/u.test(text.trim())
 			const deltaNormalized = normalizeHarnessSpeech(text, { assistantMode, hasBoundSession: Boolean(targetSessionId) }).text
-			const quickConfirmDispatch = /^(确认|确认吧|确定|确定吧|可以执行|开始执行|开工吧)[。！！，,]?$/u.test(deltaNormalized.trim())
+			const quickConfirmDispatch = /^(确认|确认吧|确定|确定吧|可以执行|开始执行|去执行吧?|执行吧|去派单吧?|派单吧|按这个做|按这个执行|开工吧)[。！！，,]?$/u.test(deltaNormalized.trim())
 			if (quickConfirmDispatch && itemId && !handledTranscriptItems.has(itemId)) {
 				handledTranscriptItems.add(itemId)
 				if (handledTranscriptItems.size > 40) handledTranscriptItems.delete(handledTranscriptItems.values().next().value)
@@ -494,6 +494,58 @@ export function attachCall(cfg, phoneWs, log, { targetSessionId = '', targetTitl
 			const asksSummarizeSession = /(总结|概括|汇总|查看|读取|识别|复述|汇报).{0,12}(当前|这个|本次|我们)?(对话|会话|聊天)|(当前|这个|本次|我们)(对话|会话|聊天).{0,12}(执行结果|结果|结论|总结|怎么样)|(对话|会话|聊天)的(执行结果|结果|结论|总结).{0,8}(怎么样|是什么|读一下|说一下|复述一下)?/.test(normalizedText)
 			const asksReadResult = /读结果|读给我听|念结果|念给我听|汇报结果|告诉我结果|说一下结果|^结果[。！？，,]?$/u.test(normalizedText)
 			const asksGenericResult = /(总结|概括|汇总|查看|读取|识别|复述|汇报|读|念|说).{0,16}(执行结果|任务结果|完成结果|结果|结论|小结)/.test(normalizedText)
+			const asksHistoryResearch = /(?:帮我)?(?:搜索|查找|查一下|找一下|翻一下|检索).{0,24}(?:历史记录|聊天记录|历史对话|以前的对话|之前的对话|以前聊过|之前聊过|以前问过|之前问过)|(?:历史记录|聊天记录|历史对话|以前的对话|之前的对话|以前聊过|之前聊过|以前问过|之前问过).{0,24}(?:搜索|查找|查一下|找一下|翻一下|检索)/.test(normalizedText)
+
+			if (asksHistoryResearch) {
+				log('route=history-research', JSON.stringify({ mode: assistantMode, sessionId: targetSessionId, text: normalizedText }))
+				sendPhone(phoneWs, { type: 'status', state: 'thinking', preview: '正在理解问题并搜索 Harness 历史正文' })
+				const scope = targetSessionId || 'global'
+				void (async () => {
+					let searched = await searchDispatchHistory(cfg, [normalizedText], targetSessionId || '')
+					searched.matches = searched.matches.filter((match) => match.sessionId !== cfg.historyResearcherSessionId && match.sessionId !== cfg.sessionDigestWriterSessionId && match.sessionId !== cfg.sessionTagSelectorSessionId && match.sessionId !== cfg.historyEvidenceSummarizerSessionId && match.sessionId !== cfg.foremanSessionId)
+					await updatePendingSessionDigests(cfg, { limit: 6 })
+					const catalog = await fetchSessionTagCatalog(cfg)
+					const normalizedQuery = String(normalizedText).toLowerCase().replace(/[\s，。！？、,.!?“”"'：:；;（）()\[\]【】_-]+/g, '')
+					const knownIdentity = [...(catalog.subjects || []), ...(catalog.keywords || [])].some((value) => {
+						const term = String(value).toLowerCase().replace(/[\s，。！？、,.!?“”"'：:；;（）()\[\]【】_-]+/g, '')
+						return term.length >= 3 && normalizedQuery.includes(term)
+					})
+					const literalReliable = knownIdentity && searched.matches[0] && (!searched.matches[1] || searched.matches[0].score >= searched.matches[1].score * 1.15)
+					if (!literalReliable) {
+						const criteria = await planTagSearch(cfg, normalizedText, catalog)
+						log('history tag criteria', JSON.stringify(criteria))
+						searched = await searchDispatchTags(cfg, criteria, targetSessionId || '')
+					}
+					if (!searched.matches.length) {
+						const speech = '我先查了原始关键词，又查了会话摘要标签，但没有找到可靠记录。你可以补充主体名称、问题现象、载体或大致时间。'
+						queueExactSpeech(speech)
+						return
+					}
+					const top = searched.matches[0]
+					const second = searched.matches[1]
+					if (second && top.score < second.score * 1.08 && top.sessionId !== targetSessionId) {
+						const speech = `我找到多个非常接近的历史对话：${top.title}；${second.title}。请补充一下插件名或当时的错误。`
+						queueExactSpeech(speech)
+						return
+					}
+					const candidates = searched.matches.filter((match, index) => index === 0 || match.score >= top.score * 0.9).slice(0, 3)
+					const evidence = await Promise.all(candidates.map(async (match) => {
+						const history = await fetchDispatchHistory(cfg, match.sessionId)
+						return { ...match, ...history }
+					}))
+					const summarized = await summarizeHistoryEvidence(cfg, normalizedText, evidence)
+					const sources = evidence.map((source) => ({ sessionId: source.sessionId, title: source.title, snippet: (source.snippets || [])[0] || '' }))
+					await saveDispatchHistoryCard(cfg, scope, { query: normalizedText, summary: summarized.raw, sources })
+					const speech = summarized.speech || '找到了相关历史，但总结为空。请打开历史搜索卡片查看来源。'
+					queueExactSpeech(speech)
+					sendPhone(phoneWs, { type: 'status', state: 'speaking', preview: speech.slice(0, 180) })
+				})().catch((err) => {
+					log('history research failed', err?.stack ?? err)
+					queueExactSpeech('历史搜索失败了，但没有修改当前对话。请稍后再试。')
+					sendPhone(phoneWs, { type: 'error', message: '历史搜索失败：' + String(err?.message ?? err) })
+				})
+				return
+			}
 
 			const explicitlyCurrent = /(当前|这个|本次|我们)(对话|会话|聊天)|(对话|会话|聊天)的(结果|进度|结论)/.test(normalizedText)
 			const asksCrossSession = assistantMode === 'session'
@@ -664,7 +716,8 @@ export function attachCall(cfg, phoneWs, log, { targetSessionId = '', targetTitl
 
 			// 保存本通电话中已经完整听写的任务描述，确认词和“要派单吗”之类确认疑问不进入任务。
 			const dispatchQuestion = /(派单|拍单|排单).{0,4}(吗|么|嘛|？|\?)|要不要.{0,4}(派单|拍单|排单)/.test(text)
-			if (!taskCaptureStarted && (looksLikeWork(text) || correctionPending) && !dispatchQuestion) taskCaptureStarted = true
+			const explicitDelegation = /(?:我希望|我要|请|帮我|麻烦).{0,24}(?:在这个对话|让(?:他|它|这个模型|电脑)|去(?:生成|制作|创建|执行|处理|完成)|帮我)/.test(text)
+			if (!taskCaptureStarted && (looksLikeWork(text) || explicitDelegation || correctionPending) && !dispatchQuestion) taskCaptureStarted = true
 			if (taskCaptureStarted && !dispatchQuestion && !/^(你好|您好|在吗|谢谢|好的|嗯|哦|啊)$/u.test(text)) {
 				taskUtterances.push(text)
 				correctionPending = false

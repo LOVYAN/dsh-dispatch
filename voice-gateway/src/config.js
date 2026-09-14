@@ -23,6 +23,10 @@ export function loadConfig() {
 	const voicePath = join(home, 'dsh-voice.json')
 	const dispatchPath = join(home, 'dsh-dispatch.json')
 	const foremanPath = join(home, 'dsh-voice-foreman.json')
+	const historyResearcherPath = join(home, 'dsh-history-researcher.json')
+	const sessionDigestWriterPath = join(home, 'dsh-session-digest-writer.json')
+	const sessionTagSelectorPath = join(home, 'dsh-session-tag-selector.json')
+	const historyEvidenceSummarizerPath = join(home, 'dsh-history-evidence-summarizer.json')
 
 	if (!existsSync(voicePath)) {
 		mkdirSync(home, { recursive: true })
@@ -46,6 +50,10 @@ export function loadConfig() {
 	const voice = readJson(voicePath) || {}
 	const dispatch = readJson(dispatchPath) || {}
 	const foreman = readJson(foremanPath) || {}
+	const historyResearcher = readJson(historyResearcherPath) || {}
+	const sessionDigestWriter = readJson(sessionDigestWriterPath) || {}
+	const sessionTagSelector = readJson(sessionTagSelectorPath) || {}
+	const historyEvidenceSummarizer = readJson(historyEvidenceSummarizerPath) || {}
 
 	const apiKey = String(voice.apiKey || voice.accessToken || '').trim()
 	const token = String(dispatch.token || '').trim()
@@ -58,6 +66,10 @@ export function loadConfig() {
 		voicePath,
 		dispatchPath,
 		foremanPath,
+		historyResearcherPath,
+		sessionDigestWriterPath,
+		sessionTagSelectorPath,
+		historyEvidenceSummarizerPath,
 		dispatchBase: String(voice.dispatchBase || 'http://127.0.0.1:3080').replace(/\/$/, ''),
 		dispatchToken: token,
 		port: Number(voice.gatewayPort || 3091),
@@ -72,6 +84,10 @@ export function loadConfig() {
 			voice: String(voice.voice || '').trim()
 		},
 		foremanSessionId: String(foreman.sessionId || '').trim(),
+		historyResearcherSessionId: String(historyResearcher.sessionId || '').trim(),
+		sessionDigestWriterSessionId: String(sessionDigestWriter.sessionId || '').trim(),
+		sessionTagSelectorSessionId: String(sessionTagSelector.sessionId || '').trim(),
+		historyEvidenceSummarizerSessionId: String(historyEvidenceSummarizer.sessionId || '').trim(),
 		priceNote: String(voice.priceNote || '')
 	}
 }
@@ -87,4 +103,30 @@ export function saveForemanSessionId(cfg, sessionId) {
 		mode: 0o600
 	})
 	cfg.foremanSessionId = sessionId
+}
+
+export function saveHistoryResearcherSessionId(cfg, sessionId) {
+	mkdirSync(dirname(cfg.historyResearcherPath), { recursive: true })
+	writeFileSync(cfg.historyResearcherPath, JSON.stringify({ sessionId }, null, 2) + '\n', {
+		encoding: 'utf8', mode: 0o600
+	})
+	cfg.historyResearcherSessionId = sessionId
+}
+
+export function saveSessionDigestWriterSessionId(cfg, sessionId) {
+	mkdirSync(dirname(cfg.sessionDigestWriterPath), { recursive: true })
+	writeFileSync(cfg.sessionDigestWriterPath, JSON.stringify({ sessionId }, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 })
+	cfg.sessionDigestWriterSessionId = sessionId
+}
+
+export function saveSessionTagSelectorSessionId(cfg, sessionId) {
+	mkdirSync(dirname(cfg.sessionTagSelectorPath), { recursive: true })
+	writeFileSync(cfg.sessionTagSelectorPath, JSON.stringify({ sessionId }, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 })
+	cfg.sessionTagSelectorSessionId = sessionId
+}
+
+export function saveHistoryEvidenceSummarizerSessionId(cfg, sessionId) {
+	mkdirSync(dirname(cfg.historyEvidenceSummarizerPath), { recursive: true })
+	writeFileSync(cfg.historyEvidenceSummarizerPath, JSON.stringify({ sessionId }, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 })
+	cfg.historyEvidenceSummarizerSessionId = sessionId
 }

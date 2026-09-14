@@ -1,4 +1,4 @@
-import { saveForemanSessionId } from './config.js'
+import { saveForemanSessionId, saveSessionDigestWriterSessionId, saveSessionTagSelectorSessionId, saveHistoryEvidenceSummarizerSessionId } from './config.js'
 import { summarizeForSpeech } from './summarize.js'
 
 export const FOREMAN_PREAMBLE = `【语音工头】你是本机 DeepSeek Harness 的总控。用户通过电话跟你说话，回复要适合朗读：短句、先结论、不要代码块、不要 URL、不要 markdown 表格。
@@ -168,6 +168,74 @@ function decodeEntities(s) {
 		.replace(/&amp;/g, '&')
 }
 
+export async function searchDispatchHistory(cfg, queries, preferredSessionId = '') {
+	const r = await fetch(cfg.dispatchBase + '/dispatch/history-search', {
+		method: 'POST', headers: headers(cfg),
+		body: JSON.stringify({ stage: 'literal', queries, preferredSessionId, excludedSessionIds: [cfg.historyResearcherSessionId, cfg.foremanSessionId].filter(Boolean) }), signal: AbortSignal.timeout(120000)
+	})
+	const body = await readBody(r)
+	if (!r.ok || !body.ok) throw new Error('history search failed: ' + JSON.stringify(body))
+	return body
+}
+
+export async function fetchPendingSessionDigests(cfg, limit = 5) {
+	const exclude = [cfg.historyResearcherSessionId, cfg.sessionDigestWriterSessionId, cfg.sessionTagSelectorSessionId, cfg.historyEvidenceSummarizerSessionId, cfg.foremanSessionId].filter(Boolean).join(',')
+	const r = await fetch(cfg.dispatchBase + '/dispatch/session-digests/pending?token=' + encodeURIComponent(cfg.dispatchToken) + '&limit=' + encodeURIComponent(limit) + '&exclude=' + encodeURIComponent(exclude), { signal: AbortSignal.timeout(120000) })
+	const body = await readBody(r)
+	if (!r.ok || !body.ok) throw new Error('pending digests failed: ' + JSON.stringify(body))
+	return body.items || []
+}
+
+export async function fetchSessionTagCatalog(cfg) {
+	const r = await fetch(cfg.dispatchBase + '/dispatch/session-tag-catalog?token=' + encodeURIComponent(cfg.dispatchToken), { signal: AbortSignal.timeout(15000) })
+	const body = await readBody(r)
+	if (!r.ok || !body.ok) throw new Error('tag catalog failed: ' + JSON.stringify(body))
+	return body.catalog || {}
+}
+
+export async function saveSessionDigest(cfg, sessionId, digest, metadata) {
+	const r = await fetch(cfg.dispatchBase + '/dispatch/session-digest', { method: 'POST', headers: headers(cfg), body: JSON.stringify({ sessionId, digest, metadata }), signal: AbortSignal.timeout(15000) })
+	const body = await readBody(r)
+	if (!r.ok || !body.ok) throw new Error('save digest failed: ' + JSON.stringify(body))
+	return body.digest
+}
+
+export async function searchDispatchTags(cfg, criteria, preferredSessionId = '') {
+	const r = await fetch(cfg.dispatchBase + '/dispatch/history-search', { method: 'POST', headers: headers(cfg), body: JSON.stringify({ stage: 'tags', criteria, preferredSessionId }), signal: AbortSignal.timeout(15000) })
+	const body = await readBody(r)
+	if (!r.ok || !body.ok) throw new Error('tag search failed: ' + JSON.stringify(body))
+	return body
+}
+
+export async function fetchDispatchHistory(cfg, sessionId, { maxPages = 4, maxMessages = 60, maxChars = 90000 } = {}) {
+	const messages = []
+	let beforeSeq
+	let title = ''
+	for (let page = 0; page < maxPages; page += 1) {
+		const qs = new URLSearchParams({ token: cfg.dispatchToken, maxMessages: String(maxMessages) })
+		if (beforeSeq !== undefined) qs.set('beforeSeq', String(beforeSeq))
+		const r = await fetch(cfg.dispatchBase + '/dispatch/session-history/' + encodeURIComponent(sessionId) + '?' + qs.toString(), { signal: AbortSignal.timeout(15000) })
+		const body = await readBody(r)
+		if (!r.ok || !body.ok) throw new Error('session history failed: ' + JSON.stringify(body))
+		title ||= String(body.title || '')
+		messages.unshift(...(body.messages || []))
+		if (!body.hasMore || body.nextBeforeSeq === undefined) break
+		beforeSeq = body.nextBeforeSeq
+		const chars = messages.reduce((sum, message) => sum + String(message.text || '').length, 0)
+		if (chars >= maxChars) break
+	}
+	return { sessionId, title, messages }
+}
+
+export async function saveDispatchHistoryCard(cfg, scope, card) {
+	const r = await fetch(cfg.dispatchBase + '/dispatch/history-card', {
+		method: 'POST', headers: headers(cfg), body: JSON.stringify({ scope, ...card }), signal: AbortSignal.timeout(10000)
+	})
+	const body = await readBody(r)
+	if (!r.ok || !body.ok) throw new Error('history card failed: ' + JSON.stringify(body))
+	return body.card
+}
+
 export async function fetchSessionResult(cfg, sessionId) {
 	const r = await fetch(
 		cfg.dispatchBase + '/dispatch/session-result/' + encodeURIComponent(sessionId)
@@ -237,13 +305,16 @@ export async function waitUntilIdle(cfg, sessionId, { timeoutMs = 15 * 60 * 1000
 		if (signal?.aborted) throw new Error('aborted')
 		const html = await fetchChatHtml(cfg, sessionId)
 		let pendingHere = false
+		let running = false
 		try {
-			const st = await dispatchStatus(cfg)
+			const [st, sessions] = await Promise.all([dispatchStatus(cfg), listDispatchSessions(cfg)])
 			pendingHere = (st.pending || []).some((p) => p.sessionId === sessionId)
+				|| (st.pendingQuestions || []).some((p) => p.sessionId === sessionId)
+			running = Boolean(sessions.find((s) => s.sessionId === sessionId)?.running)
 		} catch {
 			pendingHere = false
 		}
-		const waiting = chatWaiting(html) || pendingHere
+		const waiting = running || pendingHere
 		if (waiting) sawRunning = true
 		const text = lastAssistantFromHtml(html)
 		const changed = previousText === undefined || text !== previousText
@@ -271,6 +342,115 @@ export async function handleBoundSessionUtterance(cfg, sessionId, userText, opts
 		speech: pendingNote ? (speech + ' ' + pendingNote) : speech,
 		raw: done.text
 	}
+}
+
+function parseJsonObject(raw) {
+	const text = String(raw || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '')
+	try { return JSON.parse(text) } catch { /* find object */ }
+	const start = text.indexOf('{')
+	const end = text.lastIndexOf('}')
+	if (start >= 0 && end > start) {
+		try { return JSON.parse(text.slice(start, end + 1)) } catch { /* fallback */ }
+	}
+	return null
+}
+
+const SESSION_DIGEST_WRITER_PREAMBLE = `【会话摘要器】你只负责把所附真实会话证据压缩为结构化索引卡片，不执行任务，不修改会话，不补写证据中没有的事实。只输出严格 JSON：{"cards":[{"sessionId":"原ID","summary":"短摘要","topics":[],"subjects":[],"problems":[],"carriers":[],"outcomes":[],"keywords":[],"lastRelevantAt":0}]}。每个输入会话恰好一张卡片，sessionId原样返回。主题最多5个、主体8个、问题8个、载体6个、结论6个、关键词15个；标签短而具体。`
+const SESSION_TAG_SELECTOR_PREAMBLE = `【历史标签选择器】你只负责把一个用户问题映射到系统提供的现有标签目录。只能逐字选择目录里已有的标签，禁止创造、改写或补充任何标签，禁止根据以前轮次记忆选择。只输出严格 JSON：{"topics":[],"subjects":[],"problems":[],"carriers":[],"outcomes":[],"keywords":[],"from":0,"to":0}。先把问题分成“检索动作”和“目标内容”：以前、之前、曾经、历史里、找一下、查一下、记录里只是检索动作或时间修饰语，绝不能据此选择历史检索、搜索功能、索引、摘要等系统元标签；除非用户明确询问这些系统本身。只根据目标内容选择直接描述主题、主体、问题和载体的少量标签。`
+const HISTORY_EVIDENCE_SUMMARIZER_PREAMBLE = `【历史证据总结器】你只根据当前请求附带的来源会话、命中片段和历史消息回答用户问题。禁止引用以前轮次记忆，禁止输出JSON搜索计划，禁止执行任务或修改会话。先给结论，再说明来源、原因、处理方式和证据不足之处；适合中文语音朗读。`
+
+async function runSessionDigestWriter(cfg, instruction, opts = {}) {
+	let sessionId = cfg.sessionDigestWriterSessionId
+	let previousText = ''
+	if (sessionId) {
+		try { previousText = lastAssistantFromHtml(await fetchChatHtml(cfg, sessionId)) } catch { /* empty */ }
+	}
+	if (!sessionId) {
+		const r = await fetch(cfg.dispatchBase + '/dispatch/task', { method: 'POST', headers: headers(cfg), body: JSON.stringify({ text: SESSION_DIGEST_WRITER_PREAMBLE + '\n\n' + instruction, mode: 'queue' }), signal: AbortSignal.timeout(15000) })
+		const body = await readBody(r)
+		if (!r.ok || !body.ok || !body.sessionId) throw new Error('create digest writer failed: ' + JSON.stringify(body))
+		sessionId = body.sessionId
+		saveSessionDigestWriterSessionId(cfg, sessionId)
+	} else await sayToForeman(cfg, sessionId, instruction)
+	const done = await waitUntilIdle(cfg, sessionId, { ...opts, previousText, timeoutMs: opts.timeoutMs || 240000 })
+	return { sessionId, raw: done.text }
+}
+
+export async function updatePendingSessionDigests(cfg, { limit = 4, signal } = {}) {
+	const pending = await fetchPendingSessionDigests(cfg, limit)
+	if (!pending.length) return []
+	const sections = pending.map((item) => {
+		const compact = String(item.compactionSummary || '').slice(0, 18000)
+		const turn = item.turnResult ? `最近轮次：\n用户：${item.turnResult.instruction}\n结论：${item.turnResult.result}` : ''
+		const recent = (item.messages || []).slice(-35).map((m) => `${m.role === 'user' ? '用户' : '助手'}：${String(m.text || '').slice(0, 1200)}`).join('\n')
+		return `会话ID：${item.sessionId}\n标题：${item.title}\n更新时间：${item.updatedAt}\n压缩摘要：\n${compact}\n${turn}\n最近消息：\n${recent}`
+	})
+	const done = await runSessionDigestWriter(cfg, `生成会话摘要卡片\n\n${sections.join('\n\n---\n\n')}`.slice(0, 100000), { signal, timeoutMs: 240000 })
+	const parsed = parseJsonObject(done.raw) || {}
+	const cards = Array.isArray(parsed.cards) ? parsed.cards : []
+	const saved = []
+	for (const item of pending) {
+		const digest = cards.find((card) => String(card?.sessionId || '') === item.sessionId)
+		if (!digest) continue
+		saved.push(await saveSessionDigest(cfg, item.sessionId, digest, { title: item.title, updatedAt: item.updatedAt, sourceSeq: item.sourceSeq, compactionId: item.compactionId }))
+	}
+	return saved
+}
+
+async function runSessionTagSelector(cfg, instruction, opts = {}) {
+	let sessionId = cfg.sessionTagSelectorSessionId
+	let previousText = ''
+	if (sessionId) {
+		try { previousText = lastAssistantFromHtml(await fetchChatHtml(cfg, sessionId)) } catch { /* empty */ }
+	}
+	if (!sessionId) {
+		const r = await fetch(cfg.dispatchBase + '/dispatch/task', { method: 'POST', headers: headers(cfg), body: JSON.stringify({ text: SESSION_TAG_SELECTOR_PREAMBLE + '\n\n' + instruction, mode: 'queue' }), signal: AbortSignal.timeout(15000) })
+		const body = await readBody(r)
+		if (!r.ok || !body.ok || !body.sessionId) throw new Error('create tag selector failed: ' + JSON.stringify(body))
+		sessionId = body.sessionId
+		saveSessionTagSelectorSessionId(cfg, sessionId)
+	} else await sayToForeman(cfg, sessionId, instruction)
+	const done = await waitUntilIdle(cfg, sessionId, { ...opts, previousText, timeoutMs: opts.timeoutMs || 180000 })
+	return { sessionId, raw: done.text }
+}
+
+export async function planTagSearch(cfg, userText, catalog, opts = {}) {
+	const instruction = `选择历史标签\n当前时间：${Date.now()}\n用户问题：${String(userText || '').slice(0, 1200)}\n可用标签目录：\n${JSON.stringify(catalog).slice(0, 50000)}`
+	const done = await runSessionTagSelector(cfg, instruction, opts)
+	const parsed = parseJsonObject(done.raw) || {}
+	const result = { from: Number(parsed.from || 0), to: Number(parsed.to || 0) }
+	for (const field of ['topics', 'subjects', 'problems', 'carriers', 'outcomes', 'keywords']) {
+		const allowed = new Set((catalog[field] || []).map(String))
+		result[field] = [...new Set((Array.isArray(parsed[field]) ? parsed[field] : []).map(String).filter((x) => allowed.has(x)))].slice(0, 12)
+	}
+	return result
+}
+
+async function runHistoryEvidenceSummarizer(cfg, instruction, opts = {}) {
+	let sessionId = cfg.historyEvidenceSummarizerSessionId
+	let previousText = ''
+	if (sessionId) {
+		try { previousText = lastAssistantFromHtml(await fetchChatHtml(cfg, sessionId)) } catch { /* empty */ }
+	}
+	if (!sessionId) {
+		const r = await fetch(cfg.dispatchBase + '/dispatch/task', { method: 'POST', headers: headers(cfg), body: JSON.stringify({ text: HISTORY_EVIDENCE_SUMMARIZER_PREAMBLE + '\n\n' + instruction, mode: 'queue' }), signal: AbortSignal.timeout(15000) })
+		const body = await readBody(r)
+		if (!r.ok || !body.ok || !body.sessionId) throw new Error('create evidence summarizer failed: ' + JSON.stringify(body))
+		sessionId = body.sessionId
+		saveHistoryEvidenceSummarizerSessionId(cfg, sessionId)
+	} else await sayToForeman(cfg, sessionId, instruction)
+	const done = await waitUntilIdle(cfg, sessionId, { ...opts, previousText, timeoutMs: opts.timeoutMs || 180000 })
+	return { sessionId, raw: done.text }
+}
+
+export async function summarizeHistoryEvidence(cfg, userText, evidence, opts = {}) {
+	const compact = evidence.slice(0, 3).map((source, index) => {
+		const messages = source.messages.slice(-120).map((m) => `${m.role === 'user' ? '用户' : '助手'}：${String(m.text || '').slice(0, 2500)}`).join('\n')
+		return `来源${index + 1}：${source.title}\n命中片段：${(source.snippets || []).join('；')}\n历史消息：\n${messages}`
+	}).join('\n\n')
+	const instruction = `证据总结\n用户问题：${String(userText || '').slice(0, 1200)}\n\n${compact.slice(0, 80000)}`
+	const done = await runHistoryEvidenceSummarizer(cfg, instruction, opts)
+	return { raw: done.raw, speech: summarizeForSpeech(done.raw), researcherSessionId: done.sessionId }
 }
 
 /** First user utterance: create includes the text; later ones only continue. */
