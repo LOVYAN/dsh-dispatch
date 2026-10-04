@@ -1,6 +1,25 @@
-# build artifacts
+# build artifacts and dependencies
 dist/
+node_modules/
+**/node_modules/
 *.zip
+
+# private runtime / migration state (source repository only)
+.dsh-home*/
+**/test-home/
+**/sessions/
+**/restart-recovery/
+**/private-backups/
+backups/
+migration/
+migration-*/
+*.jsonl
+*.zstd
+*.sqlite
+*.db
+*.wav
+*.mp3
+*.m4a
 
 # local ntfy downloads / cache (never ship)
 ntfy/*.tar.gz

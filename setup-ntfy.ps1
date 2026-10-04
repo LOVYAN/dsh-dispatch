@@ -1,4 +1,4 @@
-# ntfy 一键部署：解压 zip → 写配置 → 注册计划任务 → 启动 → 测试发布
+﻿# ntfy 一键部署：解压 zip → 写配置 → 注册计划任务 → 启动 → 测试发布
 # 前置：ntfy_*_windows_x86_64.zip 已放入 $Root
 $ErrorActionPreference = 'Stop'
 $Root = Join-Path $PSScriptRoot 'ntfy'

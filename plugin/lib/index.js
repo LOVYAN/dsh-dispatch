@@ -1,12 +1,9 @@
-// dsh-dispatch v0.1.0 — phone dispatch + lock-screen approval bridge.
+// dsh-dispatch v0.2.0-rc.2.1 — phone dispatch + lock-screen approval bridge.
 //
-// Architecture (verified against DSH 0.1.0-rc.6 sources):
-//   1. Approval bridge: an in-process API client (InProcessApiClient over
-//      toFetchHandler(ctx.apiProxy)) subscribes to the mux downlink exactly like
-//      a browser tab. `approval/requested` frames arrive with their stable rpcId,
-//      so decisions can be answered through ctx respond() without touching the
-//      approval waterfall — zero interference with the GUI answerer, no
-//      listener-order sensitivity, first responder wins, replay on reconnect.
+// Architecture (DeepSeek Harness 0.2.0-rc.2):
+//   1. The local dispatch adapter uses injected host controllers and the shared
+//      Typert event gateway. Approval receipts confirm submission, not who won.
+//      Unsupported timed/plan interactions are delegated to the host UI.
 //   2. Push (optional): POST JSON to ntfy.sh (or a self-hosted ntfy). Android
 //      action buttons call back /dispatch/decision. Approvals also render on
 //      /dispatch/chat so ntfy is not required.
@@ -19,8 +16,11 @@
 
 import { Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { InProcessApiClient, toFetchHandler } from '@deepseek-ai/dsh-host-apiproxy'
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
+import { createDispatchHostAdapter, REQUIRED_HOST_SERVICES } from './dispatch-adapter/index.mjs'
+import { normalizeHistory } from './history-adapter/index.mjs'
+import { taskIdentity } from './task-identity.mjs'
+import { latestTurnResult } from './turn-result.mjs'
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { closeSync, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, extname, join, resolve, sep } from 'node:path'
@@ -37,12 +37,14 @@ const VIDEO_CHUNK_BYTES = 4 * 1024 * 1024
 const VIDEO_UPLOAD_TTL_MS = 24 * 60 * 60 * 1000
 
 export class DispatchService extends Service {
-	static inject = ['webServer', 'apiProxy']
+	static inject = ['webServer', ...REQUIRED_HOST_SERVICES]
 
 	static Config = z.object({
 		token: z.string().default(''),
 		/** Phone-reachable base for decision links, e.g. https://pc.example.ts.net (empty = log-only links). */
 		publicBaseUrl: z.string().default(''),
+		/** Explicit independent voice origin; isolated tests must not use production 8443. */
+		voiceBaseUrl: z.string().default(''),
 		/** ntfy server base URL. Default is the public ntfy.sh over HTTP/80. */
 		ntfyServerUrl: z.string().default('http://ntfy.sh'),
 		ntfyTopic: z.string().default(''),
@@ -82,7 +84,8 @@ export class DispatchService extends Service {
 		/** Model-generated structured session digests used for semantic tag lookup. */
 		this.sessionDigests = this.loadSessionDigests()
 		this.sessionRunningState = new Map()
-		this.client = new InProcessApiClient(toFetchHandler(this.ctx.apiProxy), 120000)
+		this.client = createDispatchHostAdapter(this.ctx)
+		this.ctx.effect(() => () => this.client.dispose())
 		this.start()
 	}
 
@@ -353,9 +356,9 @@ export class DispatchService extends Service {
 	}
 
 	onApprovalRequested(rpcId, frame) {
-		// 去重用稳定键：approvalId 是审计关联的确定派生，跨重放恒定；rpcId 理论上重放复用但不赌它
+		// rc2 approvalId is a synthetic event identity, not an audit correlation id.
 		const dedupeKey = `${frame.sessionId}/${frame.approvalId}`
-		if (!this.markSeen(dedupeKey)) return // 重放帧，已推过
+		const firstSeen = this.markSeen(dedupeKey) // Rebuild pending on replay; suppress only duplicate push.
 		const entry = {
 			sessionId: frame.sessionId,
 			approvalId: frame.approvalId,
@@ -366,7 +369,7 @@ export class DispatchService extends Service {
 		this.pendingByKey.set(dedupeKey, rpcId)
 		this.note('approval-requested', { rpcId, ...entry })
 		this.log(`approval requested session=${frame.sessionId} tool=${frame.toolName} reason=${entry.reason}`)
-		if (this.config.pushEnabled) void this.notify(rpcId, entry)
+		if (firstSeen && this.config.pushEnabled) void this.notify(rpcId, entry)
 	}
 
 	buildDecisionUrl(rpcId, outcome) {
@@ -773,27 +776,41 @@ export class DispatchService extends Service {
 	}
 
 	foldHistory(entries) {
-		const out = []
-		for (const entry of entries ?? []) {
-			const ev = entry?.event ?? entry
-			if (!ev || typeof ev !== 'object') continue
-			if (ev.type === 'user/message') {
-				const src = ev.data?.source ?? ev.data?.message?.source
-				const kind = src?.kind
-				if (kind && kind !== 'user') continue
-				const blocks = ev.data?.content ?? ev.data?.message?.content
-				const text = this.blocksText(blocks)
-				const images = this.blocksImages(blocks)
-				if (text && text.startsWith('/permission ')) continue
-				if (text || images.length) out.push({ role: 'user', text, images, time: ev.time })
-			} else if (ev.type === 'assistant/message') {
-				const blocks = ev.data?.message?.content ?? ev.data?.content
-				const text = this.visibleAssistantText(this.blocksText(blocks))
-				const images = this.blocksImages(blocks)
-				if (text || images.length) out.push({ role: 'assistant', text, images, time: ev.time })
+		const normalized = normalizeHistory(entries ?? [])
+		for (const d of normalized.diagnostics) this.note('history-diagnostic', { code: d.code, seq: d.seq })
+		return normalized.messages
+	}
+
+	// Display-only projection: command records never enter chat folding or run-state heuristics.
+	renderHistoryProjection(projection, sessionId) {
+		const rows = projection.messages.map((m) => {
+			const who = m.role === 'user' ? '你' : '助手'
+			const pics = (m.images ?? []).map((img) => {
+				if (img.attachmentId) return `<img class="pic" alt="" src="${this.escHtml(this.imgPath(sessionId, img.attachmentId))}">`
+				if (img.data) return `<img class="pic" alt="" src="data:${this.escHtml(img.mediaType || 'image/jpeg')};base64,${img.data}">`
+				return ''
+			}).join('')
+			return { seq: m.seq, html: `<div class="msg ${m.role}"><div class="meta">${who}</div>${this.escHtml(m.text || '')}${pics}</div>` }
+		})
+		for (const command of projection.commandRecords) {
+			const literal = '/' + command.name + (command.inputRecorded ? command.args : '')
+			const gaps = []
+			if (!command.inputRecorded) gaps.push('输入未记录；不从其他事件推断。')
+			if (command.status === 'outcome-not-in-window') gaps.push('本页未包含此命令的回复；不能据此判断正在运行、失败或取消。')
+			if (command.status === 'invalid-outcome') gaps.push('回复记录无效，未展示；不推断执行结果。')
+			rows.push({ seq: command.seq, html: '<div class="msg historical-command"><div class="meta">历史命令（只读）</div>' + this.escHtml(literal) + (gaps.length ? '<div class="muted">' + gaps.join('\n') + '</div>' : '') + '</div>' })
+			if (command.outcome) {
+				const outcome = command.outcome
+				rows.push({ seq: outcome.seq, html: '<div class="msg historical-command-reply"><div class="meta">历史命令回复（只读） · ' + this.escHtml('/' + command.name) + ' · ' + (outcome.kind === 'success' ? '记录为成功' : '记录为错误') + '</div>' + (outcome.text === undefined ? '<div class="muted">回复未记录文本。</div>' : this.escHtml(outcome.text)) + (outcome.sourceEventSeq !== undefined ? '<div class="muted">关联的领域展示未投影；不从引用推断内容。</div>' : '') + '</div>' })
 			}
 		}
-		return out
+		// Never manufacture chronology from timestamps or array positions when sequences are unsafe.
+		const safeOrder = rows.every(row => Number.isSafeInteger(row.seq) && row.seq >= 0) && new Set(rows.map(row => row.seq)).size === rows.length
+		if (safeOrder) rows.sort((a, b) => a.seq - b.seq)
+		const partial = !projection.complete ? '<p class="muted" role="note">本页历史投影不完整；缺少配对记录或存在未展示事件。请查看其他历史页，不据此推断缺失内容或执行状态。</p>' : ''
+		const orphanNote = projection.diagnostics.some(d => d.code === 'command-run-not-in-window') ? '<p class="muted" role="note">本页包含命令回复事件，但缺少对应的命令记录；未展示孤立回复，也未将其归属为助手消息。请查看其他历史页。</p>' : ''
+		const orderNote = !safeOrder ? '<p class="muted" role="note">记录缺少唯一稳定序号，聊天与命令分组展示，不代表交错时间顺序。</p>' : ''
+		return partial + orphanNote + orderNote + (rows.map(row => row.html).join('') || '<p class="muted">本页没有可展示的聊天消息或完整可识别的历史命令；不代表没有其他交互记录。</p>')
 	}
 
 	titleFromProjections(projections, fallback) {
@@ -923,21 +940,17 @@ export class DispatchService extends Service {
 			const hist = await this.client.sessions.history({ sessionId, maxMessages: 60 })
 			if (!hist.result.ok) throw new Error(hist.result.error || 'history failed')
 			const folded = this.foldHistory(hist.result.value.events)
-			let assistantIndex = -1
-			for (let i = folded.length - 1; i >= 0; i--) {
-				if (folded[i].role === 'assistant' && folded[i].text?.trim()) { assistantIndex = i; break }
-			}
-			let userIndex = -1
-			for (let i = assistantIndex - 1; i >= 0; i--) {
-				if (folded[i].role === 'user' && !this.isSyntheticTurnInstruction(folded[i].text)) { userIndex = i; break }
-			}
+			const latest = latestTurnResult(hist.result.value.events, folded)
 			const previous = this.turnResults.get(sessionId)
-			const result = isError ? String(error || '任务执行失败') : String(folded[assistantIndex]?.text || '').trim()
-			if (!result) return previous || null
+			if (!latest.settled) return null
+			if (previous?.sourceSeq === latest.sourceSeq) return previous
+			isError = latest.isError
+			const result = latest.result
 			const record = {
 				sessionId,
 				completedAt: Date.now(),
-				instruction: String(folded[userIndex]?.text || '').slice(0, 2000),
+				instruction: String(latest.instruction || '').slice(0, 2000),
+				sourceSeq: latest.sourceSeq,
 				result: result.slice(0, 12000),
 				speechSummary: this.resultSpeechSummary(result),
 				isError: Boolean(isError),
@@ -952,7 +965,7 @@ export class DispatchService extends Service {
 			return record
 		} catch (err) {
 			this.log('turn result capture failed:', sessionId, err?.message ?? err)
-			return this.turnResults.get(sessionId) || null
+			return null // Never turn unavailable current history into a stale success.
 		}
 	}
 
@@ -987,11 +1000,18 @@ export class DispatchService extends Service {
 	}
 
 	voiceJs() {
+		let configuredBase = ''
+		if (this.config.voiceBaseUrl) {
+			const url = new URL(this.config.voiceBaseUrl)
+			if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error('Invalid voiceBaseUrl')
+			configuredBase = url.href.replace(/\/$/, '') + '/'
+		}
+		const baseExpression = configuredBase ? JSON.stringify(configuredBase).replace(/</g, '\\u003c') : '"https://"+location.hostname+":8443/"'
 		return [
 			'<script>(function(){',
 			'var btn=document.getElementById("sts-voice-toggle");var panel=document.getElementById("sts-voice-panel");var close=document.getElementById("sts-voice-close");var frame=document.getElementById("sts-voice-frame");if(!btn||!panel||!frame)return;',
 			'var state={sessionId:"",token:"",mode:"session"};try{var el=document.getElementById("dsh-voice-state");if(el)state=JSON.parse(el.textContent||"{}")}catch(e){}',
-			'var base="https://"+location.hostname+":8443/";var q=new URLSearchParams({token:state.token||"",mode:state.mode||"session"});if(state.sessionId)q.set("sessionId",state.sessionId);if(state.title)q.set("title",state.title);var voiceUrl=base+"?"+q.toString();frame.src=voiceUrl;',
+			'var base=' + baseExpression + ';var q=new URLSearchParams({token:state.token||"",mode:state.mode||"session"});if(state.sessionId)q.set("sessionId",state.sessionId);if(state.title)q.set("title",state.title);var voiceUrl=base+"?"+q.toString();frame.src=voiceUrl;',
 			'function closeVoice(){panel.hidden=true;window.__dshVoiceBusy=false;frame.src=voiceUrl}',
 			'btn.addEventListener("click",function(){panel.hidden=false;window.__dshVoiceBusy=true});',
 			'if(close)close.addEventListener("click",closeVoice);',
@@ -1187,11 +1207,9 @@ export class DispatchService extends Service {
 			const resultMatch = route.match(/^\/dispatch\/session-result\/([^/]+)$/)
 			if (resultMatch && req.method === 'GET') {
 				const sessionId = decodeURIComponent(resultMatch[1])
-				let record = this.turnResults.get(sessionId)
-				if (!record) {
-					record = await this.captureTurnResult(sessionId)
-					if (record) record = { ...record, backfilled: true }
-				} else if (!record.speechSummary && record.result) {
+				// Persisted cache is historical evidence, not proof of the latest turn.
+				let record = await this.captureTurnResult(sessionId)
+				if (record && !record.speechSummary && record.result) {
 					record = { ...record, speechSummary: this.resultSpeechSummary(record.result) }
 					this.turnResults.set(sessionId, record)
 					this.persistTurnResults()
@@ -1235,7 +1253,7 @@ export class DispatchService extends Service {
 			const historyMatch = route.match(/^\/dispatch\/session-history\/([^/]+)$/)
 			if (historyMatch && req.method === 'GET') {
 				const sessionId = decodeURIComponent(historyMatch[1])
-				const page = await this.sessionHistoryPage(sessionId, urlObj.searchParams.get('beforeSeq'), urlObj.searchParams.get('maxMessages'))
+				const page = await this.sessionHistoryPage(sessionId, urlObj.searchParams.get('beforeSeq'), urlObj.searchParams.get('maxMessages'), urlObj.searchParams.get('historyToken'))
 				let title = sessionId.slice(-12)
 				try {
 					const listed = await this.client.sessions.list({})
@@ -1366,7 +1384,7 @@ export class DispatchService extends Service {
 		const returnSessionId = String(fields.returnSessionId || '')
 		const entry = this.pendingQuestions.get(rpcId)
 		if (!entry) {
-			return this.sendResultPage(res, '⏳', '这个问题已经回答', '可能电脑端已经先行提交，无需重复操作。',
+			return this.sendResultPage(res, '⏳', '问题已不在等待列表', '可能已被回答、取消或连接中断；请查看会话状态，不要据此认定回答成功。',
 				returnSessionId ? `<p style="margin-top:20px"><a href="${this.escHtml(this.chatPath(returnSessionId))}" style="color:#8be9fd">返回会话</a></p>` : '')
 		}
 		const action = String(fields.questionAction || 'answer')
@@ -1379,7 +1397,8 @@ export class DispatchService extends Service {
 					if (String(fields[`q${qi}o${oi}`] || '') === '1') selected.push(q.options[oi].label)
 				}
 			} else {
-				const picked = Number(fields[`q${qi}pick`])
+				const rawPick = fields[`q${qi}pick`]
+				const picked = rawPick === null || rawPick === undefined || rawPick === '' ? NaN : Number(rawPick)
 				if (Number.isInteger(picked) && picked >= 0 && picked < (q.options ?? []).length) selected.push(q.options[picked].label)
 			}
 			const custom = String(fields[`q${qi}custom`] || '').trim()
@@ -1394,6 +1413,11 @@ export class DispatchService extends Service {
 			type: 'client-response', rpcId,
 			result: { ok: true, value: { sessionId: entry.sessionId, answer: { answers } } }
 		})
+		if (receipt.submitted) {
+			this.pendingQuestions.delete(rpcId)
+			this.note('question-submitted-unconfirmed', { rpcId, sessionId: entry.sessionId })
+			return this.sendResultPage(res, '⏳', '回答已发送，结果待确认', '系统已收到响应，但无法确认此答案是否被采纳；也可能已由其他客户端处理。请返回会话查看状态。', `<p><a href="${this.escHtml(this.chatPath(returnSessionId || entry.sessionId))}">返回会话</a></p>`)
+		}
 		if (!receipt.accepted) {
 			if (receipt.reason === 'not-pending') this.pendingQuestions.delete(rpcId)
 			return this.sendResultPage(res, '⏳', '回答没有提交', receipt.reason === 'not-pending' ? '电脑端已经先行回答。' : `Harness 拒绝了回答：${receipt.reason || 'unknown'}`,
@@ -1410,9 +1434,11 @@ export class DispatchService extends Service {
 			rpcId,
 			result: { ok: true, value: { sessionId, approvalId, outcome } }
 		})
-		this.pending.delete(rpcId)
-		for (const [k, v] of this.pendingByKey) if (v === rpcId) { this.pendingByKey.delete(k); break }
-		this.note('decided', { rpcId, outcome, receipt })
+		if (receipt.submitted || receipt.accepted || receipt.reason === 'not-pending') {
+			this.pending.delete(rpcId)
+			for (const [k, v] of this.pendingByKey) if (v === rpcId) { this.pendingByKey.delete(k); break }
+		}
+		this.note('decision-response', { rpcId, outcome, receipt })
 		this.log(`decision ${outcome} for ${sessionId}/${approvalId} → receipt=${JSON.stringify(receipt)}`)
 		return receipt
 	}
@@ -1428,8 +1454,11 @@ export class DispatchService extends Service {
 				sessionId ? `<p style="margin-top:20px"><a href="${this.escHtml(this.chatPath(sessionId))}" style="color:#8be9fd">打开会话</a></p>` : '')
 		}
 		const receipt = await this.applyDecision(rpcId, outcome, sessionId, approvalId)
+		if (receipt.submitted) {
+			return this.sendResultPage(res, '⏳', '审批响应已发送，结果待确认', '系统已收到响应，但这不证明审批已生效。请查看会话状态，不要重复批准。', sessionId ? `<p><a href="${this.escHtml(this.chatPath(sessionId))}">打开会话</a></p>` : '')
+		}
 		if (!receipt.accepted) {
-			return this.sendResultPage(res, '⏳', '该审批已被处理', '电脑端已先行答复 —— 无需重复操作',
+			return this.sendResultPage(res, '⏳', '审批状态未确认', receipt.reason === 'not-pending' ? '当前请求已不在等待列表中，可能已处理或取消。' : '未能确认响应结果，请查看会话状态，不要自动重试。',
 				sessionId ? `<p style="margin-top:20px"><a href="${this.escHtml(this.chatPath(sessionId))}" style="color:#8be9fd">打开会话</a></p>` : '')
 		}
 		this.sendResultPage(res,
@@ -1448,16 +1477,17 @@ export class DispatchService extends Service {
 		for (const summary of summaries) {
 			const cached = this.historySearchIndex.get(summary.sessionId)
 			if (cached && Number(cached.sourceSeq || 0) > 0 && Object.hasOwn(cached, 'latestCompaction') && Number(cached.updatedAt || 0) === Number(summary.updatedAt || 0)) continue
-			const all = []
 			const allEvents = []
 			let beforeSeq
+			let historyToken
 			for (let page = 0; page < 5; page += 1) {
 				const request = { sessionId: summary.sessionId, maxMessages: 100 }
 				if (beforeSeq !== undefined) request.beforeSeq = beforeSeq
+				if (historyToken) request.historyToken = historyToken
 				const hist = await this.client.sessions.history(request)
 				if (!hist.result.ok) break
 				const events = hist.result.value.events ?? []
-				all.unshift(...this.foldHistory(events))
+				historyToken = hist.result.value.historyToken
 				allEvents.unshift(...events)
 				let minSeq
 				for (const entry of events) {
@@ -1467,7 +1497,7 @@ export class DispatchService extends Service {
 				if (!hist.result.value.hasMore || minSeq === undefined) break
 				beforeSeq = minSeq
 			}
-			const messages = all.slice(-400).map((m) => ({ role: m.role, text: String(m.text || '').slice(0, 6000), time: m.time || 0 })).filter((m) => m.text)
+			const messages = this.foldHistory(allEvents).slice(-400).map((m) => ({ role: m.role, text: String(m.text || '').slice(0, 6000), time: m.time || 0 })).filter((m) => m.text)
 			let latestCompaction = null
 			let sourceSeq = 0
 			for (const entry of allEvents) {
@@ -1619,19 +1649,22 @@ export class DispatchService extends Service {
 		return out
 	}
 
-	async sessionHistoryPage(sessionId, beforeSeq, maxMessages = 60) {
+	async sessionHistoryPage(sessionId, beforeSeq, maxMessages = 60, historyToken) {
 		const request = { sessionId, maxMessages: Math.max(1, Math.min(100, Number(maxMessages) || 60)) }
-		if (Number.isInteger(Number(beforeSeq)) && Number(beforeSeq) >= 0) request.beforeSeq = Number(beforeSeq)
+		if (historyToken) request.historyToken = String(historyToken)
+		if (beforeSeq !== null && beforeSeq !== undefined && beforeSeq !== '' && Number.isInteger(Number(beforeSeq)) && Number(beforeSeq) >= 0) request.beforeSeq = Number(beforeSeq)
 		const hist = await this.client.sessions.history(request)
 		if (!hist.result.ok) throw new Error(JSON.stringify(hist.result.error))
 		const events = hist.result.value.events ?? []
 		const messages = this.foldHistory(events)
+		const projection = normalizeHistory(events)
 		let nextBeforeSeq
 		for (const entry of events) {
 			const seq = Number(entry?.seq)
 			if (Number.isInteger(seq) && (nextBeforeSeq === undefined || seq < nextBeforeSeq)) nextBeforeSeq = seq
 		}
-		return { messages, hasMore: Boolean(hist.result.value.hasMore), nextBeforeSeq }
+		return { messages, commandRecords: projection.commandRecords, projectionComplete: projection.complete, projectionDiagnosticCodes: [...new Set(projection.diagnostics.map(d => d.code))], hasMore: Boolean(hist.result.value.hasMore), nextBeforeSeq,
+			historyToken: hist.result.value.historyToken, throughSeq: hist.result.value.throughSeq, consistency: hist.result.value.consistency }
 	}
 
 	saveHistoryCard(scope, card) {
@@ -1672,7 +1705,7 @@ export class DispatchService extends Service {
 		const all = (listed.result.value.items ?? []).filter((s) => !s.blank && s.origin !== 'subagent')
 		const live = all.filter((s) => !archived.has(s.sessionId))
 		const archivedRows = all.filter((s) => archived.has(s.sessionId))
-		const items = (showArchived ? archivedRows : live).slice(0, 40)
+		const items = showArchived ? archivedRows : live // Preserve access to every migrated conversation; no silent 40-row truncation.
 		const parentBySid = new Map()
 		for (const s of listed.result.value.items ?? []) {
 			if (s.origin === 'subagent' && s.parentSessionId) parentBySid.set(s.sessionId, s.parentSessionId)
@@ -1802,6 +1835,12 @@ export class DispatchService extends Service {
 
 	async handleChatView(rawId, urlObj, res) {
 		const sessionId = decodeURIComponent(rawId.split('?')[0])
+		if (urlObj.searchParams.get('restore') === '1') {
+			const restored = await this.client.workspace.unarchiveSession({ sessionId })
+			if (!restored.result.ok) return this.sendJson(res, 502, { ok: false, error: restored.result.error })
+			this.note('unarchived', { sessionId })
+			return this.redirect(res, this.chatPath(sessionId))
+		}
 		if (urlObj.searchParams.get('archive') === '1') {
 			const archived = await this.client.workspace.archiveSession({ sessionId })
 			if (!archived.result.ok) {
@@ -1851,20 +1890,48 @@ export class DispatchService extends Service {
 			}
 			return this.redirect(res, this.chatPath(sessionId))
 		}
-		const hist = await this.client.sessions.history({ sessionId, maxMessages: 40 })
-		if (!hist.result.ok) {
-			return this.sendHtml(res, this.pageShell('会话', `<main><p>读历史失败：${this.escHtml(JSON.stringify(hist.result.error))}</p></main>`), 502)
+		// Pagination URLs contain private dispatch and snapshot tokens, never public cache/referrer data.
+		res.setHeader('Cache-Control', 'private, no-store')
+		res.setHeader('Referrer-Policy', 'no-referrer')
+		const latestLink = '<a rel="noreferrer" href="' + this.escHtml(this.chatPath(sessionId)) + '">返回最新记录</a>'
+		const beforeParam = urlObj.searchParams.get('beforeSeq')
+		const historyToken = urlObj.searchParams.get('historyToken')
+		const validToken = (token) => typeof token === 'string' && token.length > 0 && token.length <= 512 && !/[\s\u0000-\u001f\u007f]/u.test(token)
+		const validSeq = (seq) => Number.isSafeInteger(seq) && seq >= 0
+		if (urlObj.searchParams.getAll('beforeSeq').length > 1 || urlObj.searchParams.getAll('historyToken').length > 1 ||
+			(beforeParam !== null && (!/^(0|[1-9]\d*)$/.test(beforeParam) || !validSeq(Number(beforeParam)) || !validToken(historyToken))) ||
+			(historyToken !== null && !validToken(historyToken))) {
+			return this.sendHtml(res, this.pageShell('会话', '<main><p>历史分页参数无效，请返回最新记录重新浏览。</p><p>' + latestLink + '</p></main>'), 400)
 		}
-		const folded = this.foldHistory(hist.result.value.events)
-		const msgs = folded.map((m) => {
-			const who = m.role === 'user' ? '你' : '助手'
-			const pics = (m.images ?? []).map((img) => {
-				if (img.attachmentId) return `<img class="pic" alt="" src="${this.escHtml(this.imgPath(sessionId, img.attachmentId))}">`
-				if (img.data) return `<img class="pic" alt="" src="data:${this.escHtml(img.mediaType || 'image/jpeg')};base64,${img.data}">`
-				return ''
-			}).join('')
-			return `<div class="msg ${m.role}"><div class="meta">${who}</div>${this.escHtml(m.text || '')}${pics}</div>`
-		}).join('') || '<p class="muted">还没有可见消息（可能还在跑工具）</p>'
+		const historyBrowsing = beforeParam !== null || historyToken !== null
+		const request = { sessionId, maxMessages: 40 }
+		if (beforeParam !== null) request.beforeSeq = Number(beforeParam)
+		if (historyToken !== null) request.historyToken = historyToken
+		let hist
+		try { hist = await this.client.sessions.history(request) } catch {
+			return this.sendHtml(res, this.pageShell('会话', '<main><p>读历史失败，请返回最新记录重试。</p><p>' + latestLink + '</p></main>'), 502)
+		}
+		if (!hist.result.ok) {
+			const expired = hist.result.error?.code === 'adapter/history-cut-expired'
+			return this.sendHtml(res, this.pageShell('会话', '<main><p>' + (expired ? '历史快照已过期或不可用，请返回最新记录重新浏览。' : '读历史失败，请返回最新记录重试。') + '</p><p>' + latestLink + '</p></main>'), expired ? 410 : 502)
+		}
+		const events = hist.result.value.events ?? []
+		let nextBeforeSeq
+		for (const event of events) {
+			if (validSeq(event?.seq) && (nextBeforeSeq === undefined || event.seq < nextBeforeSeq)) nextBeforeSeq = event.seq
+		}
+		const nextToken = hist.result.value.historyToken
+		const canPage = hist.result.value.hasMore && validToken(nextToken) && validSeq(nextBeforeSeq) &&
+			(beforeParam === null || nextBeforeSeq < Number(beforeParam))
+		const earlierLink = canPage
+			? '<a rel="noreferrer" href="' + this.escHtml(this.chatPath(sessionId) + '&' + new URLSearchParams({ beforeSeq: String(nextBeforeSeq), historyToken: nextToken }).toString()) + '">更早记录</a>'
+			: hist.result.value.hasMore ? '<span>更早记录暂不可用，请返回最新记录重试。</span>' : '<span>已到此快照的最早聊天记录。</span>'
+		const historyNav = '<nav aria-label="历史分页"><p>' + earlierLink + ' · ' + latestLink + '</p>' +
+			(historyBrowsing ? '<p class="muted">正在浏览历史快照，不会自动刷新；新消息请返回最新记录查看。</p>' : '') + '</nav>'
+		const projection = normalizeHistory(events)
+		for (const d of projection.diagnostics) this.note('history-diagnostic', { code: d.code, seq: d.seq })
+		const folded = projection.messages
+		const msgs = this.renderHistoryProjection(projection, sessionId)
 		const listedForTree = await this.client.sessions.list({})
 		const summaries = listedForTree.result.ok ? (listedForTree.result.value.items ?? []) : []
 		const children = new Map()
@@ -1907,7 +1974,7 @@ export class DispatchService extends Service {
 		const last = folded[folded.length - 1]
 		const awaitingReply = !last || last.role === 'user'
 		const sent = Boolean(urlObj.searchParams.get('sent'))
-		const waiting = pendingHere.length > 0 || questionsHere.length > 0 || running || (sent && awaitingReply)
+		const waiting = !historyBrowsing && (pendingHere.length > 0 || questionsHere.length > 0 || running || (sent && awaitingReply))
 		const steerNotice = urlObj.searchParams.get('steered') === '1'
 			? '<div class="banner"><strong>⚡ 已插队</strong><div class="muted">消息已注入当前运行轮次。</div></div>'
 			: urlObj.searchParams.get('steerFallback') === '1'
@@ -1933,6 +2000,7 @@ export class DispatchService extends Service {
 			'try{sessionStorage.setItem(nk,String(n))}catch(e){}',
 			'function pinComposer(){var el=document.getElementById("composer")||ta;if(el)el.scrollIntoView({block:"end"})}',
 			'function restore(){',
+			historyBrowsing ? 'return;' : '',
 			waiting ? 'pinComposer();return;' : '',
 			'  var grew=n>prevN;',
 			'  if(grew){pinComposer();return}',
@@ -1952,7 +2020,7 @@ export class DispatchService extends Service {
 		const archivedSet = await this.archivedIdSet()
 		const isArchived = archivedSet.has(sessionId)
 		const archiveLink = isArchived
-			? '<span class="muted">已归档 · 恢复请在电脑 GUI 操作</span>'
+			? '<a href="' + this.escHtml(this.chatPath(sessionId) + '&restore=1') + '">已归档 · 恢复会话</a>'
 			: '<a href="' + this.escHtml(this.chatPath(sessionId) + '&archive=1') + '" onclick="return confirm(\'归档后会从进行中列表消失，日志还在。确定？\')">归档</a>'
 		let modelForm = ''
 		let modelLabel = ''
@@ -2012,9 +2080,10 @@ export class DispatchService extends Service {
 			'<header class="chat-header"><a href="' + this.escHtml(this.chatPath()) + '">← 会话列表</a><strong style="margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + this.escHtml(currentTitle) + '</strong></header>',
 			questionModal,
 			'<main>', extra, banners,
+			'<p class="muted" role="note">历史展示说明：此页显示已提交的聊天消息及可识别的只读历史命令/回复；跨页命令配对、领域展示、审批及未提交的排队状态可能不完整。原始记录保留，页面不代表全部交互事件。</p>',
 			this.renderHistoryCards(sessionId),
 			this.voicePanel({ sessionId, title: currentTitle, token: this.config.token, mode: 'session' }),
-			msgs,
+			historyNav, msgs, historyNav,
 			'<form id="composer" class="js-chat" method="post" action="' + this.escHtml(this.chatPath(sessionId)) + '" enctype="multipart/form-data">',
 			'<textarea name="text" rows="3" placeholder="继续说…"></textarea>',
 			'<input type="file" name="attachments" accept="image/jpeg,image/png,image/webp,image/gif,video/mp4,video/webm,video/quicktime" multiple>',
@@ -2049,14 +2118,15 @@ export class DispatchService extends Service {
 		if (!text && !images.length && !video) return this.redirect(res, this.chatPath(sessionId))
 		const requestedMode = String(fields.mode || '') === 'steer' ? 'steer' : 'queue'
 		const content = this.promptContent(text, images, video)
+		const requestId = randomUUID()
 		let actualMode = requestedMode
-		let prompted = await this.client.sessions.prompt({ sessionId, mode: actualMode, content })
+		let prompted = await this.client.sessions.prompt({ requestId, sessionId, mode: actualMode, content })
 		if (!prompted.result.ok && requestedMode === 'steer') {
 			const code = String(prompted.result.error?.code || '')
 			const reason = String(prompted.result.error?.details?.reason || '')
-			if (code === 'agent-busy' || code === 'steer-unavailable' || /steer|running|current turn/i.test(reason)) {
+			if (code === 'session/agent-busy' || code === 'session/steer-unavailable' || code === 'agent-busy' || code === 'steer-unavailable') {
 				actualMode = 'queue'
-				prompted = await this.client.sessions.prompt({ sessionId, mode: actualMode, content })
+				prompted = await this.client.sessions.prompt({ requestId, sessionId, mode: actualMode, content })
 			}
 		}
 		if (!prompted.result.ok) {
@@ -2108,11 +2178,16 @@ export class DispatchService extends Service {
 		const text = typeof body.text === 'string' ? body.text : ''
 		if (!text.trim()) return this.sendJson(res, 400, { ok: false, error: 'text required' })
 		const mode = body.mode === 'steer' ? 'steer' : 'queue'
+		let identity
+		try { identity = taskIdentity(dirname(this.secretsPath()), body) } catch (error) {
+			return this.sendJson(res, error.statusCode || 500, { ok: false, error: error.statusCode ? error.message : 'request identity storage failed' })
+		}
+		if (identity.replay) return this.sendJson(res, identity.state === 'admitted' ? 200 : 409, { ok: identity.state === 'admitted', sessionId: identity.sessionId, requestId: identity.requestId, replay: true, ...(identity.state === 'admitted' ? {} : { error: 'submission-outcome-uncertain-do-not-retry' }) })
 		const createPayload = {}
 		if (body.workspaceId) createPayload.workspaceId = body.workspaceId
 		else if (body.cwd) createPayload.cwd = body.cwd
 		if (body.agentPreset) createPayload.agentPreset = body.agentPreset
-		if (body.sessionId) createPayload.sessionId = body.sessionId
+		if (identity.sessionId) createPayload.sessionId = identity.sessionId
 		const created = await this.client.sessions.create(createPayload)
 		if (!created.result.ok) {
 			this.log('task create failed:', JSON.stringify(created.result.error))
@@ -2122,12 +2197,14 @@ export class DispatchService extends Service {
 		const prompted = await this.client.sessions.prompt({
 			sessionId,
 			mode,
+			requestId: identity.requestId,
 			content: [{ type: 'text', text }]
 		})
 		if (!prompted.result.ok) {
 			this.log('task prompt failed:', JSON.stringify(prompted.result.error))
 			return this.sendJson(res, 502, { ok: false, stage: 'prompt', sessionId, error: prompted.result.error })
 		}
+		identity.markAdmitted?.()
 		this.note('task', { sessionId, mode, text: text.slice(0, 120) })
 		this.trackedTasks.set(sessionId, { snippet: text.slice(0, 80).replace(/\s+/g, ' '), at: Date.now() })
 		this.log(`task dispatched → ${sessionId}`)

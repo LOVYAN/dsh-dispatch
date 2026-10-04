@@ -1,4 +1,5 @@
 import { WebSocket } from 'ws'
+import { submissionFailureNotice } from './submission-notice.js'
 import { looksLikeConfirmDispatch, looksLikeWork, summarizeForSpeech } from './summarize.js'
 import { normalizeHarnessSpeech } from './semantic.js'
 import { dispatchIndependentTask, fetchDispatchHistory, fetchSessionTagCatalog, handleBoundSessionUtterance, handleUserUtterance, inspectBoundSession, listDispatchSessions, matchDispatchSessions, planTagSearch, saveDispatchHistoryCard, searchDispatchHistory, searchDispatchTags, summarizeActiveSessions, summarizeHistoryEvidence, updatePendingSessionDigests } from './foreman.js'
@@ -63,7 +64,7 @@ export function attachCall(cfg, phoneWs, log, { targetSessionId = '', targetTitl
 	let sessionReady = false
 	let botSpeaking = false
 	let greetDone = false
-	let turnAbort = null
+	const turnAborts = new Set()
 	let upFrames = 0
 	let assistantText = ''
 	let lastSpokenText = '在，你说。'
@@ -103,7 +104,8 @@ export function attachCall(cfg, phoneWs, log, { targetSessionId = '', targetTitl
 	const end = (why) => {
 		if (closed) return
 		closed = true
-		try { turnAbort?.abort() } catch { /* ignore */ }
+		// Stop local result observation only; admitted Harness work remains independent.
+		for (const controller of turnAborts) controller.abort()
 		try { if (volcWs) closeSession(volcWs) } catch { /* ignore */ }
 		try { volcWs?.close() } catch { /* ignore */ }
 		try { phoneWs.close() } catch { /* ignore */ }
@@ -291,7 +293,7 @@ export function attachCall(cfg, phoneWs, log, { targetSessionId = '', targetTitl
 				log('independent tasks dispatched', 'success', succeeded.length, 'failed', failed, results.map((x) => x.status === 'fulfilled' ? x.value.sessionId : String(x.reason?.message || x.reason)))
 				const speech = failed === 0
 					? `已经分别创建${succeeded.length}个 Harness 会话并提交。`
-					: succeeded.length ? `已成功提交${succeeded.length}个任务，另有${failed}个创建失败。` : `这${failed}个任务都没有提交成功。`
+					: `已确认提交${succeeded.length}个任务，另有${failed}个任务未能确认提交结果。请核查原请求，不要重复提交或换新请求编号重试。`
 				queueExactSpeech(speech)
 			})
 			.finally(() => { busy = false })
@@ -307,7 +309,7 @@ export function attachCall(cfg, phoneWs, log, { targetSessionId = '', targetTitl
 		const instruction = `用户已在语音通话中听完计划并明确确认派单。请直接执行，不要再次等待确认。\n\n审批协议：delegated subagent 的审批被禁用。子任务若遇到权限不足，必须把所需工具、完整参数、理由和影响返回主会话；主会话亲自重放该操作并发起审批，让用户在当前手机会话页批准。禁止子任务绕过审批或因为不能审批就结束整个任务。\n\n完整任务上下文：\n${taskBody}`
 		const dispatchKey = explicitTasks.length === 2 ? `global-split:${taskBody}` : instruction
 		if (dispatchKey === lastDispatchedInstruction) {
-			sendPhone(phoneWs, { type: 'status', state: 'listening', preview: '这个任务已经交给电脑了，仍可继续说' })
+			sendPhone(phoneWs, { type: 'status', state: 'listening', preview: '这个任务已发起提交，请核查原请求，不要重复提交' })
 			return false
 		}
 		lastDispatchedInstruction = dispatchKey
@@ -318,7 +320,6 @@ export function attachCall(cfg, phoneWs, log, { targetSessionId = '', targetTitl
 		if (explicitTasks.length === 2) dispatchGlobalTasks(explicitTasks)
 		else {
 			runForeman(instruction)
-			queueExactSpeech(targetSessionId ? '好，已经交给当前 Harness 对话。' : '好，已经交给电脑。')
 		}
 		return true
 	}
@@ -326,27 +327,39 @@ export function attachCall(cfg, phoneWs, log, { targetSessionId = '', targetTitl
 	const runForeman = (instruction, { fromTool, callId } = {}) => {
 		if (busy) log('another background dispatch already running; DSH queue will serialize if needed')
 		busy = true
-		sendPhone(phoneWs, { type: 'status', state: 'listening', preview: '任务已交给电脑，语音仍可继续使用' })
-		turnAbort = new AbortController()
+		sendPhone(phoneWs, { type: 'status', state: 'listening', preview: '正在提交任务，语音仍可继续使用' })
+		const turnAbort = new AbortController()
+		turnAborts.add(turnAbort)
+		let admitted = false
+		const onAdmitted = ({ sessionId }) => {
+			admitted = true
+			log('task admission confirmed', sessionId)
+			if (closed) return
+			sendPhone(phoneWs, { type: 'status', state: 'listening', sessionId, preview: '任务已确认提交，尚未确认完成，语音仍可继续使用' })
+			queueExactSpeech(targetSessionId ? '好，已经交给当前 Harness 对话。' : '好，已经交给电脑。')
+		}
 		const work = targetSessionId
-			? handleBoundSessionUtterance(cfg, targetSessionId, instruction, { signal: turnAbort.signal })
-			: handleUserUtterance(cfg, instruction, { signal: turnAbort.signal })
+			? handleBoundSessionUtterance(cfg, targetSessionId, instruction, { signal: turnAbort.signal, onAdmitted })
+			: handleUserUtterance(cfg, instruction, { signal: turnAbort.signal, onAdmitted })
 
 		void work.then((result) => {
-			if (fromTool && callId && volcWs) toolResult(volcWs, callId, JSON.stringify({ ok: true, sessionId: result.sessionId }))
+			if (closed) return
+			if (fromTool && callId && volcWs) toolResult(volcWs, callId, JSON.stringify({ ok: result.outcome === 'reply', admitted, outcome: result.outcome, taskSuccess: 'unknown', sessionId: result.sessionId }))
 			lastCompletedSpeech = result.speech || ''
 			lastCompletedRaw = result.raw || ''
-			const notice = '任务完成了。需要的话，对我说读结果。'
+			const notice = result.notice || submissionFailureNotice({ admitted }).message
 			if (volcWs && !closed) speakExact(volcWs, notice)
 			sendPhone(phoneWs, { type: 'status', state: 'speaking', sessionId: result.sessionId, preview: notice })
-		}).catch((err) => {
-			const msg = '电脑没接上：' + String(err?.message ?? err)
-			log(msg)
-			if (fromTool && callId && volcWs) toolResult(volcWs, callId, JSON.stringify({ ok: false, error: String(err?.message ?? err) }))
-			if (!closed && volcWs) speakExact(volcWs, '电脑这边没接上，过会儿再说。')
-			sendPhone(phoneWs, { type: 'error', message: msg })
+		}).catch(() => {
+			const notice = submissionFailureNotice({ admitted, closed })
+			log('task observation ended', { admitted, closed, message: notice.message })
+			if (notice.silent) return
+			if (fromTool && callId && volcWs) toolResult(volcWs, callId, JSON.stringify({ ok: false, admitted, error: notice.message }))
+			if (volcWs) speakExact(volcWs, notice.message)
+			sendPhone(phoneWs, { type: 'error', message: notice.message })
 		}).finally(() => {
-			busy = false
+			turnAborts.delete(turnAbort)
+			busy = turnAborts.size > 0
 		})
 	}
 
@@ -795,7 +808,7 @@ export function attachCall(cfg, phoneWs, log, { targetSessionId = '', targetTitl
 			const raw = ev.error?.message || ev.message || JSON.stringify(ev)
 			const isTtsTimeout = /52000016|AudioTTSIdleTimeoutError/i.test(raw)
 			const msg = isTtsTimeout
-				? '火山语音合成超时，这通语音会话已中断；任务尚未派出，请重新接通后再说'
+				? '火山语音合成超时，语音暂时不可用；电脑任务状态未判定，请核查原会话，不要重复提交。'
 				: raw
 			log('volc error', raw)
 			sendPhone(phoneWs, { type: 'error', message: msg, code: isTtsTimeout ? 'audio_tts_timeout' : 'volc_error' })

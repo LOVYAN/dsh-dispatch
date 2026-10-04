@@ -13,7 +13,19 @@ DeepSeek Harness 的 **Cordis 插件**：用手机给本机 Agent 派任务、�
 | 豆包实时语音对谈、读结果、确认后派单 | 独立 `voice-gateway/`，默认 3091 | 否 |
 | 锁屏弹通知、点【批准】【拒绝】 | 手机装 ntfy，订阅安装脚本打印的主题 | 可选 |
 
-最低配置：**电脑有 DSH + PC/手机同一 Tailscale 账号 + 系统浏览器**。
+最低配置：**DeepSeek Harness 0.2.0-rc.2 + Node.js 22或更新版本 + PC/手机同一 Tailscale 账号 + 系统浏览器**。
+
+## rc2 兼容更新
+
+本分支面向 **DSH 0.2.0-rc.2**，不再假定 rc6 的旧版进程内 API。安装前备份自己的 DSH home，并明确指定当前正在使用的 `DSH_HOME`；不要把旧 home 或迁移测试 home 当作新版运行目录。
+
+- 使用新版会话控制器、共享事件流和审批提交回执。提交收到不等于审批已经胜出。
+- 手机历史支持固定快照的“更早记录／返回最新记录”；快照过期时给出恢复入口，不悄悄重置。
+- 已记录的命令与回复单独标为只读历史，不冒充助手消息，也不会重新执行。无法确定的队列/内部事件仍明确标记为部分投影，不声称完整还原所有运行痕迹。
+- 派单保留请求标识；网络结果不确定时不自动重发，避免重复任务。
+- 独立语音保持独立进程；收到派单确认后再播报，挂断不等于取消远端任务，助手产生回复不等于目标已完成。
+
+本仓库仅包含可移植源码、测试和模板，不包含个人对话、账号、浏览器资料或本机迁移备份。
 
 ## 安装（Windows）
 
@@ -26,26 +38,20 @@ DeepSeek Harness 的 **Cordis 插件**：用手机给本机 Agent 派任务、�
    ```
 
    ```powershell
-   # B. 还没有 dsh plugin 命令时
+   # B. Windows安装器：明确指定正在使用的home，不自动猜旧目录
+   $env:DSH_HOME = 'D:\path\to\your-dsh-home'
    pwsh -File install.ps1
    ```
 
-3. 如需同时配置豆包语音，可直接传 API Key：
-
-   ```powershell
-   pwsh -File install.ps1 -VolcApiKey "你的 X-Api-Key"
-   ```
-
-   不传参数时安装器会安全提示输入；配置只写入 `$DSH_HOME/dsh-voice.json`。部分火山账号若要求 App ID/Resource ID，可用 `-VolcAppId`、`-VolcResourceId`，或安装后编辑本机配置。
+3. 如需豆包语音，安装器会在配置不存在时生成模板；随后编辑本机 `$DSH_HOME/dsh-voice.json`。不要把真实密钥写进命令历史、仓库模板或提交记录。部分火山账号还需要 App ID/Resource ID，请按账号要求填写。只安装插件可用 `-SkipVoice`；显式离线复制可用 `-CopyOnly -SkipVoice`，不会在CLI失败后偷偷回退。
 4. **重启** DeepSeek Harness，并运行 `pwsh -File start-voice.ps1` 启动独立 3091 网关。
 5. 打开 `http://127.0.0.1:3080/dispatch/health` 和 `http://127.0.0.1:3091/health`，都应返回健康状态。
-5. 脚本结束时会打印：
-   - 手机会话页 URL（含 token）
-   - 可选的 ntfy 主题名  
+6. 从本机 `$DSH_HOME/dsh-dispatch.json` 读取首次运行生成的token和可选ntfy主题。用自己配置的Tailscale地址打开 `/dispatch/chat?token=…` 并加入书签；不要公开这个完整链接。
+7. 重启后可执行 `pwsh -File verify.ps1 -DshHome $env:DSH_HOME -CheckVoice`，进行只读健康和鉴权检查，不自动创建任务。
 
-   把会话页加到手机浏览器书签即可。
+首次启动把 token / 主题写到 `$DSH_HOME/dsh-dispatch.json`（不要提交）。安装器不会自动改动Tailscale路由；请自行将Web和独立语音服务映射到需要的HTTPS入口。
 
-首次启动把 token / 主题写到 `$DSH_HOME/dsh-dispatch.json`（不要提交）。`install.ps1` 若检测到 Tailscale，会尝试开启 Serve。
+ntfy开关以宿主的**有效插件配置**为准：后加载的patch如果设为 `pushEnabled: false`，仅修改保存token的JSON不会开启通知。需要在对应patch恢复 `pushEnabled: true` 并重启宿主。测试阶段可禁用推送，正式使用前应显式核对；HTTP发布成功不等于手机已收到通知。
 
 **不要把 `dsh-dispatch.json` 或含 token 的 `cordis.patch.yml` 提交到 git。**
 
@@ -81,7 +87,7 @@ docs/                   手机配置、快捷指令、设计笔记
 - 手机点批准 → `/dispatch/decision` 或会话页 `?decide=` → `respond()` 注入决策  
   与网页 GUI 平级，先答先赢
 - `POST /dispatch/task` 或会话页表单 → `sessions.create` + `sessions.prompt`
-- 一轮结束 → 推「✅ 任务完成」（可点【打开会话】）
+- 被跟踪的一轮结束 → 发送结果通知（可点【打开会话】）；通知中的完成措辞仅表示该轮结束，不是对业务目标达成的独立验证。
 
 路由都在 `/dispatch/*`，**不走** `/api` 信任栅栏，token 就是鉴权。
 
@@ -97,7 +103,9 @@ pwsh -File deploy.ps1
 
 然后重启 DeepSeek Harness。`deploy.ps1` 只覆盖插件文件，不改 token。
 
-要求：DeepSeek Harness **0.1.0-rc.6** 附近（`webServer` + `apiProxy` + `InProcessApiClient`）。
+兼容目标：DeepSeek Harness **0.2.0-rc.2**（新版会话控制器与宿主网关）。旧rc6用户不要直接覆盖安装本分支。插件根包和 `plugin/` 镜像必须一起更新；安装/部署需复制完整 `lib/`，不能只复制 `lib/index.js`。
+
+本仓库不会发布某台电脑的进程PID、迁移目录或重启配置。宿主重启由你自己的服务管理器负责；部署脚本不能代替已验证的备份和重启流程。
 
 ## 同步到 GitHub
 

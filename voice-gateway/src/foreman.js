@@ -1,5 +1,7 @@
 import { saveForemanSessionId, saveSessionDigestWriterSessionId, saveSessionTagSelectorSessionId, saveHistoryEvidenceSummarizerSessionId } from './config.js'
 import { summarizeForSpeech } from './summarize.js'
+import { createTaskOperation, submitTaskOperation } from './task-operation.js'
+import { classifyTurnOutcome } from './turn-outcome.js'
 
 export const FOREMAN_PREAMBLE = `【语音工头】你是本机 DeepSeek Harness 的总控。用户通过电话跟你说话，回复要适合朗读：短句、先结论、不要代码块、不要 URL、不要 markdown 表格。
 
@@ -84,26 +86,13 @@ export function matchDispatchSessions(sessions, spokenText, limit = 3) {
 export async function ensureForeman(cfg, firstUserText) {
 	if (cfg.foremanSessionId) return cfg.foremanSessionId
 	const boot = FOREMAN_PREAMBLE + '\n' + firstUserText
-	const r = await fetch(cfg.dispatchBase + '/dispatch/task', {
-		method: 'POST',
-		headers: headers(cfg),
-		body: JSON.stringify({ text: boot, mode: 'queue' })
-	})
-	const j = await readBody(r)
-	if (!r.ok || !j.ok) throw new Error('create foreman: ' + JSON.stringify(j))
+	const j = await submitTaskOperation(cfg, createTaskOperation(boot))
 	saveForemanSessionId(cfg, j.sessionId)
 	return j.sessionId
 }
 
 export async function dispatchIndependentTask(cfg, text) {
-	const r = await fetch(cfg.dispatchBase + '/dispatch/task', {
-		method: 'POST',
-		headers: headers(cfg),
-		body: JSON.stringify({ text, mode: 'queue' }),
-		signal: AbortSignal.timeout(15000)
-	})
-	const body = await readBody(r)
-	if (!r.ok || !body.ok || !body.sessionId) throw new Error('independent task create failed: ' + JSON.stringify(body))
+	const body = await submitTaskOperation(cfg, createTaskOperation(text))
 	return { sessionId: body.sessionId }
 }
 
@@ -208,23 +197,47 @@ export async function searchDispatchTags(cfg, criteria, preferredSessionId = '')
 }
 
 export async function fetchDispatchHistory(cfg, sessionId, { maxPages = 4, maxMessages = 60, maxChars = 90000 } = {}) {
+	if (![maxPages, maxMessages, maxChars].every((n) => Number.isSafeInteger(n) && n > 0)) throw new Error('invalid history limits')
 	const messages = []
 	let beforeSeq
+	let historyToken
+	let throughSeq
+	let consistency
 	let title = ''
+	let hasMore = false
+	let nextBeforeSeq
 	for (let page = 0; page < maxPages; page += 1) {
 		const qs = new URLSearchParams({ token: cfg.dispatchToken, maxMessages: String(maxMessages) })
 		if (beforeSeq !== undefined) qs.set('beforeSeq', String(beforeSeq))
+		if (historyToken !== undefined) qs.set('historyToken', historyToken)
 		const r = await fetch(cfg.dispatchBase + '/dispatch/session-history/' + encodeURIComponent(sessionId) + '?' + qs.toString(), { signal: AbortSignal.timeout(15000) })
 		const body = await readBody(r)
-		if (!r.ok || !body.ok) throw new Error('session history failed: ' + JSON.stringify(body))
+		if (!r.ok || !body.ok) throw new Error('session history failed: http ' + r.status)
+		if (body.sessionId !== sessionId) throw new Error('session history session mismatch')
+		if (!Array.isArray(body.messages) || typeof body.hasMore !== 'boolean') throw new Error('malformed session history')
+		if (typeof body.historyToken !== 'string' || !body.historyToken.trim()) throw new Error('session history missing historyToken')
+		if (historyToken !== undefined && body.historyToken !== historyToken) throw new Error('session history changed historyToken')
+		if (body.throughSeq !== undefined) {
+			if (!Number.isSafeInteger(body.throughSeq) || body.throughSeq < 0) throw new Error('session history invalid throughSeq')
+			if (throughSeq !== undefined && body.throughSeq !== throughSeq) throw new Error('session history changed cut')
+		} else if (throughSeq !== undefined) throw new Error('session history missing cut')
+		if (body.consistency !== undefined && body.consistency !== (page === 0 ? 'opening-cut' : 'pinned-cut')) throw new Error('session history inconsistent cut')
+		throughSeq = body.throughSeq
+		consistency = body.consistency
+		historyToken = body.historyToken
+		hasMore = body.hasMore
+		nextBeforeSeq = body.nextBeforeSeq
+		if (hasMore && (!Number.isSafeInteger(nextBeforeSeq) || nextBeforeSeq < 0 || (beforeSeq !== undefined && nextBeforeSeq >= beforeSeq))) {
+			throw new Error('session history missing or nondecreasing cursor')
+		}
 		title ||= String(body.title || '')
-		messages.unshift(...(body.messages || []))
-		if (!body.hasMore || body.nextBeforeSeq === undefined) break
-		beforeSeq = body.nextBeforeSeq
+		messages.unshift(...body.messages)
+		if (!hasMore) break
+		beforeSeq = nextBeforeSeq
 		const chars = messages.reduce((sum, message) => sum + String(message.text || '').length, 0)
 		if (chars >= maxChars) break
 	}
-	return { sessionId, title, messages }
+	return { sessionId, title, messages, historyToken, throughSeq, consistency, hasMore, nextBeforeSeq, truncated: hasMore }
 }
 
 export async function saveDispatchHistoryCard(cfg, scope, card) {
@@ -244,7 +257,8 @@ export async function fetchSessionResult(cfg, sessionId) {
 	)
 	if (!r.ok) throw new Error('session result http ' + r.status)
 	const data = await readBody(r)
-	return data?.result ? { ...data.result, title: data.title || '' } : null
+	if (data?.ok !== true || data.sessionId !== sessionId || !Object.hasOwn(data, 'result')) throw new Error('invalid session result envelope')
+	return data.result ? { ...data.result, title: data.title || '' } : null
 }
 
 export async function fetchChatHtml(cfg, sessionId) {
@@ -306,11 +320,14 @@ export async function waitUntilIdle(cfg, sessionId, { timeoutMs = 15 * 60 * 1000
 		const html = await fetchChatHtml(cfg, sessionId)
 		let pendingHere = false
 		let running = false
+		let statusKnown = false
 		try {
 			const [st, sessions] = await Promise.all([dispatchStatus(cfg), listDispatchSessions(cfg)])
 			pendingHere = (st.pending || []).some((p) => p.sessionId === sessionId)
 				|| (st.pendingQuestions || []).some((p) => p.sessionId === sessionId)
-			running = Boolean(sessions.find((s) => s.sessionId === sessionId)?.running)
+			const session = sessions.find((s) => s.sessionId === sessionId)
+			statusKnown = Boolean(session) && typeof session.running === 'boolean' && Array.isArray(st.pending) && Array.isArray(st.pendingQuestions)
+			running = Boolean(session?.running)
 		} catch {
 			pendingHere = false
 		}
@@ -318,7 +335,7 @@ export async function waitUntilIdle(cfg, sessionId, { timeoutMs = 15 * 60 * 1000
 		if (waiting) sawRunning = true
 		const text = lastAssistantFromHtml(html)
 		const changed = previousText === undefined || text !== previousText
-		if (!waiting && text && (sawRunning || changed)) {
+		if (statusKnown && !waiting && text && (sawRunning || changed)) {
 			return { html, pendingHere, text }
 		}
 		await sleep(intervalMs, signal)
@@ -326,22 +343,40 @@ export async function waitUntilIdle(cfg, sessionId, { timeoutMs = 15 * 60 * 1000
 	throw new Error('foreman timeout')
 }
 
-export async function handleBoundSessionUtterance(cfg, sessionId, userText, opts = {}) {
-	let previousText = ''
-	try { previousText = lastAssistantFromHtml(await fetchChatHtml(cfg, sessionId)) } catch { /* empty */ }
-	await sayToForeman(cfg, sessionId, userText)
-	const done = await waitUntilIdle(cfg, sessionId, { ...opts, previousText })
-	let pendingNote = ''
+async function priorOutcomeSeq(cfg, sessionId) {
 	try {
-		const st = await dispatchStatus(cfg)
-		if ((st.pending || []).length) pendingNote = '需要你在当前手机会话页批准权限。'
-	} catch { /* ignore */ }
-	const speech = summarizeForSpeech(done.text)
-	return {
-		sessionId,
-		speech: pendingNote ? (speech + ' ' + pendingNote) : speech,
-		raw: done.text
+		const record = await fetchSessionResult(cfg, sessionId)
+		// null can mean an open turn, not an empty session: no safe baseline.
+		return record?.sessionId === sessionId && Number.isSafeInteger(record?.sourceSeq) && record.sourceSeq > 0 ? record.sourceSeq : undefined
+	} catch { return undefined }
+}
+
+export async function waitForTurnOutcome(cfg, sessionId, { timeoutMs = 15 * 60 * 1000, intervalMs = 4000, signal, previousSourceSeq } = {}) {
+	const t0 = Date.now()
+	while (Date.now() - t0 < timeoutMs) {
+		if (signal?.aborted) throw new Error('aborted')
+		const [status, sessions] = await Promise.all([dispatchStatus(cfg), listDispatchSessions(cfg)])
+		const session = sessions.find(row => row.sessionId === sessionId)
+		const known = typeof session?.running === 'boolean' && Array.isArray(status.pending) && Array.isArray(status.pendingQuestions)
+		const waiting = session?.running || (status.pending || []).some(row => row.sessionId === sessionId)
+			|| (status.pendingQuestions || []).some(row => row.sessionId === sessionId)
+		if (known && !waiting) {
+			let record = null
+			try { record = await fetchSessionResult(cfg, sessionId) } catch { /* unknown, never HTML fallback */ }
+			if (signal?.aborted) throw new Error('aborted')
+			const outcome = classifyTurnOutcome(record, { sessionId, previousSourceSeq })
+			return { sessionId, ...outcome, speech: outcome.raw ? summarizeForSpeech(outcome.raw) : '' }
+		}
+		await sleep(intervalMs, signal)
 	}
+	throw new Error('foreman timeout')
+}
+
+export async function handleBoundSessionUtterance(cfg, sessionId, userText, opts = {}) {
+	const previousSourceSeq = await priorOutcomeSeq(cfg, sessionId)
+	await sayToForeman(cfg, sessionId, userText)
+	opts.onAdmitted?.({ sessionId })
+	return waitForTurnOutcome(cfg, sessionId, { ...opts, previousSourceSeq })
 }
 
 function parseJsonObject(raw) {
@@ -366,9 +401,7 @@ async function runSessionDigestWriter(cfg, instruction, opts = {}) {
 		try { previousText = lastAssistantFromHtml(await fetchChatHtml(cfg, sessionId)) } catch { /* empty */ }
 	}
 	if (!sessionId) {
-		const r = await fetch(cfg.dispatchBase + '/dispatch/task', { method: 'POST', headers: headers(cfg), body: JSON.stringify({ text: SESSION_DIGEST_WRITER_PREAMBLE + '\n\n' + instruction, mode: 'queue' }), signal: AbortSignal.timeout(15000) })
-		const body = await readBody(r)
-		if (!r.ok || !body.ok || !body.sessionId) throw new Error('create digest writer failed: ' + JSON.stringify(body))
+		const body = await submitTaskOperation(cfg, createTaskOperation(SESSION_DIGEST_WRITER_PREAMBLE + '\n\n' + instruction))
 		sessionId = body.sessionId
 		saveSessionDigestWriterSessionId(cfg, sessionId)
 	} else await sayToForeman(cfg, sessionId, instruction)
@@ -404,9 +437,7 @@ async function runSessionTagSelector(cfg, instruction, opts = {}) {
 		try { previousText = lastAssistantFromHtml(await fetchChatHtml(cfg, sessionId)) } catch { /* empty */ }
 	}
 	if (!sessionId) {
-		const r = await fetch(cfg.dispatchBase + '/dispatch/task', { method: 'POST', headers: headers(cfg), body: JSON.stringify({ text: SESSION_TAG_SELECTOR_PREAMBLE + '\n\n' + instruction, mode: 'queue' }), signal: AbortSignal.timeout(15000) })
-		const body = await readBody(r)
-		if (!r.ok || !body.ok || !body.sessionId) throw new Error('create tag selector failed: ' + JSON.stringify(body))
+		const body = await submitTaskOperation(cfg, createTaskOperation(SESSION_TAG_SELECTOR_PREAMBLE + '\n\n' + instruction))
 		sessionId = body.sessionId
 		saveSessionTagSelectorSessionId(cfg, sessionId)
 	} else await sayToForeman(cfg, sessionId, instruction)
@@ -433,9 +464,7 @@ async function runHistoryEvidenceSummarizer(cfg, instruction, opts = {}) {
 		try { previousText = lastAssistantFromHtml(await fetchChatHtml(cfg, sessionId)) } catch { /* empty */ }
 	}
 	if (!sessionId) {
-		const r = await fetch(cfg.dispatchBase + '/dispatch/task', { method: 'POST', headers: headers(cfg), body: JSON.stringify({ text: HISTORY_EVIDENCE_SUMMARIZER_PREAMBLE + '\n\n' + instruction, mode: 'queue' }), signal: AbortSignal.timeout(15000) })
-		const body = await readBody(r)
-		if (!r.ok || !body.ok || !body.sessionId) throw new Error('create evidence summarizer failed: ' + JSON.stringify(body))
+		const body = await submitTaskOperation(cfg, createTaskOperation(HISTORY_EVIDENCE_SUMMARIZER_PREAMBLE + '\n\n' + instruction))
 		sessionId = body.sessionId
 		saveHistoryEvidenceSummarizerSessionId(cfg, sessionId)
 	} else await sayToForeman(cfg, sessionId, instruction)
@@ -456,26 +485,11 @@ export async function summarizeHistoryEvidence(cfg, userText, evidence, opts = {
 /** First user utterance: create includes the text; later ones only continue. */
 export async function handleUserUtterance(cfg, userText, opts = {}) {
 	const had = Boolean(cfg.foremanSessionId)
-	let previousText
-	if (had) {
-		try { previousText = lastAssistantFromHtml(await fetchChatHtml(cfg, cfg.foremanSessionId)) } catch { previousText = '' }
-	} else {
-		previousText = ''
-	}
+	const previousSourceSeq = had ? await priorOutcomeSeq(cfg, cfg.foremanSessionId) : 0
 	const sessionId = await ensureForeman(cfg, userText)
 	if (had) await sayToForeman(cfg, sessionId, userText)
-	const done = await waitUntilIdle(cfg, sessionId, { ...opts, previousText })
-	let pendingNote = ''
-	try {
-		const st = await dispatchStatus(cfg)
-		if ((st.pending || []).length) pendingNote = '需要你在手机会话页点批准。'
-	} catch { /* ignore */ }
-	const speech = summarizeForSpeech(done.text)
-	return {
-		sessionId,
-		speech: pendingNote ? (speech + ' ' + pendingNote) : speech,
-		raw: done.text
-	}
+	opts.onAdmitted?.({ sessionId })
+	return waitForTurnOutcome(cfg, sessionId, { ...opts, previousSourceSeq })
 }
 
 function sleep(ms, signal) {

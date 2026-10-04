@@ -1,54 +1,51 @@
-# 重启后冒烟。token 从本机 cordis.patch.yml 读取，不写死。
-# 用法：pwsh -File verify.ps1 [-DispatchTest]
-param([switch]$DispatchTest)
-$ErrorActionPreference = 'Continue'
-$base = 'http://127.0.0.1:3080'
-
-function Find-Patch {
-	$candidates = @(
-		(Join-Path $PSScriptRoot '..\..\.dsh-home\profiles\web\cordis.patch.yml'),
-		(Join-Path $env:USERPROFILE '.dsh-home\profiles\web\cordis.patch.yml')
-	)
-	if ($env:DSH_HOME) {
-		$candidates = @((Join-Path $env:DSH_HOME 'profiles\web\cordis.patch.yml')) + $candidates
-	}
-	foreach ($c in $candidates) {
-		$full = [IO.Path]::GetFullPath($c)
-		if (Test-Path $full) { return $full }
-	}
-	return $null
-}
-
-$patch = Find-Patch
-$token = $null
-$publicBase = $null
-if ($patch) {
-	$raw = Get-Content $patch -Raw -Encoding UTF8
-	if ($raw -match '(?m)^\s+token:\s+(\S+)') { $token = $Matches[1].Trim("'`"") }
-	if ($raw -match '(?m)^\s+publicBaseUrl:\s+(\S+)') { $publicBase = $Matches[1].Trim("'`"") }
-}
-if (-not $token) {
-	Write-Host 'WARN: 读不到 token，status 检查会跳过。把 DSH_HOME 指到配置目录，或先跑 install.ps1。'
-}
-
-Write-Host '== 1. health =='
-try { (Invoke-WebRequest "$base/dispatch/health" -UseBasicParsing -TimeoutSec 5).Content } catch { Write-Host "FAIL: $($_.Exception.Message)"; exit 1 }
-
-if ($token) {
-	Write-Host "`n== 2. status (auth) =="
-	try { (Invoke-WebRequest "$base/dispatch/status?token=$token" -UseBasicParsing -TimeoutSec 5).Content } catch { Write-Host "FAIL: $($_.Exception.Message)" }
-
-	Write-Host "`n== 3. bad token rejected =="
-	try { (Invoke-WebRequest "$base/dispatch/status?token=wrong" -UseBasicParsing -TimeoutSec 5).Content; Write-Host 'UNEXPECTED: bad token accepted!' } catch { Write-Host "OK rejected: $($_.Exception.Response.StatusCode.value__)" }
-}
-
-if ($DispatchTest -and $token) {
-	Write-Host "`n== 4. task dispatch =="
-	$body = @{ text = '[verify.ps1] 派单链路检查：只回复「收到」。' } | ConvertTo-Json
-	try { (Invoke-WebRequest "$base/dispatch/task?token=$token" -Method POST -ContentType 'application/json; charset=utf-8' -Body $body -UseBasicParsing -TimeoutSec 60).Content } catch { Write-Host "FAIL: $($_.Exception.Message)" }
-}
-
-if ($publicBase) {
-	Write-Host "`n== 5. publicBaseUrl health =="
-	try { (Invoke-WebRequest "$publicBase/dispatch/health" -UseBasicParsing -TimeoutSec 8).Content } catch { Write-Host "serve 未就绪: $($_.Exception.Message)" }
+# Read-only HTTP smoke checks. No task submission, model calls or restart.
+param(
+    [string]$DshHome = '',
+    [string]$BaseUrl = 'http://127.0.0.1:3080',
+    [string]$VoiceBaseUrl = 'http://127.0.0.1:3091',
+    [switch]$CheckVoice,
+    [switch]$HealthOnly,
+    [switch]$DispatchTest
+)
+$ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'portable-common.ps1')
+try {
+    if ($DispatchTest) { throw '-DispatchTest is intentionally disabled: verification must not submit tasks or spend model credits.' }
+    $selectedHome = Resolve-DispatchHome $DshHome
+    $base = $BaseUrl.TrimEnd('/')
+    $uri = [uri]$base
+    if (-not $uri.IsAbsoluteUri -or $uri.Scheme -notin @('http', 'https')) { throw 'BaseUrl must be an absolute HTTP(S) URL.' }
+    $response = Invoke-WebRequest "$base/dispatch/health" -UseBasicParsing -TimeoutSec 10
+    if ([int]$response.StatusCode -ne 200) { throw 'Dispatch health did not return HTTP 200.' }
+    Write-Host 'PASS dispatch health'
+    if (-not $HealthOnly) {
+        # rc2 dispatch persists generated credentials at the selected home, not arbitrary YAML.
+        $configPath = Join-Path $selectedHome 'dsh-dispatch.json'
+        if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) { throw 'Selected home has no dsh-dispatch.json; use -HealthOnly explicitly to skip authentication checks.' }
+        $config = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if (-not $config.PSObject.Properties['token'] -or -not $config.token) { throw 'Selected home dispatch config has no token.' }
+        $response = Invoke-WebRequest "$base/dispatch/status" -Headers @{ Authorization = "Bearer $($config.token)" } -UseBasicParsing -TimeoutSec 10
+        if ([int]$response.StatusCode -ne 200) { throw 'Authenticated status did not return HTTP 200.' }
+        Write-Host 'PASS authenticated status'
+        $badStatus = 0
+        try {
+            $response = Invoke-WebRequest "$base/dispatch/status" -Headers @{ Authorization = "Bearer invalid-$([guid]::NewGuid().ToString('n'))" } -UseBasicParsing -TimeoutSec 10
+            $badStatus = [int]$response.StatusCode
+        } catch {
+            if ($_.Exception.Response) { $badStatus = [int]$_.Exception.Response.StatusCode }
+            else { throw 'Bad-token check had a transport failure, not an authorization rejection.' }
+        }
+        if ($badStatus -notin @(401, 403)) { throw "Bad-token request returned HTTP $badStatus; expected 401 or 403." }
+        Write-Host 'PASS invalid token rejected'
+    } else { Write-Host 'Authentication checks explicitly skipped (-HealthOnly).' }
+    if ($CheckVoice) {
+        $response = Invoke-WebRequest "$($VoiceBaseUrl.TrimEnd('/'))/health" -UseBasicParsing -TimeoutSec 10
+        if ([int]$response.StatusCode -ne 200) { throw 'Independent voice health did not return HTTP 200.' }
+        Write-Host 'PASS independent voice health'
+    }
+    exit 0
+} catch {
+    # Do not print HTTP response bodies or credentials.
+    Write-Error "Verification failed: $($_.Exception.Message)"
+    exit 1
 }
